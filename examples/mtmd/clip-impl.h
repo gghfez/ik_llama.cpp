@@ -26,6 +26,7 @@
 #define KEY_N_BLOCK             "clip.%s.block_count"
 #define KEY_PROJ_DIM            "clip.%s.projection_dim"
 #define KEY_N_HEAD              "clip.%s.attention.head_count"
+#define KEY_N_HEAD_KV           "clip.%s.attention.head_count_kv"
 #define KEY_LAYER_NORM_EPS      "clip.%s.attention.layer_norm_epsilon"
 
 // vision-specific
@@ -48,6 +49,7 @@
 #define KEY_IMAGE_CROP_RESOLUTION "clip.vision.image_crop_resolution"
 #define KEY_WIN_ATTN_PATTERN      "clip.vision.n_wa_pattern"
 #define KEY_ATTN_WINDOW_SIZE      "clip.vision.window_size"
+#define KEY_WA_PATTERN_MODE       "clip.vision.wa_pattern_mode"
 #define KEY_MINICPMV_VERSION      "clip.minicpmv_version"
 #define KEY_MINICPMV_QUERY_NUM    "clip.minicpmv_query_num"
 
@@ -55,6 +57,12 @@
 #define KEY_AUDIO_PROJ_TYPE     "clip.audio.projector_type" // for models with mixed modalities
 #define KEY_A_NUM_MEL_BINS      "clip.audio.num_mel_bins"
 #define KEY_A_PROJ_STACK_FACTOR "clip.audio.projector.stack_factor"
+#define KEY_A_RVQ_NUM_QUANTIZERS  "clip.audio.rvq.num_quantizers"   // mimo_audio
+#define KEY_A_RVQ_CODEBOOK_SIZE   "clip.audio.rvq.codebook_size"    // mimo_audio: per-quantizer bin count
+#define KEY_A_WA_PATTERN_MODE     "clip.audio.wa_pattern_mode"      // mimo_audio: per-layer -1 (full) / 0 (windowed)
+#define KEY_A_ATTN_WINDOW_SIZE    "clip.audio.window_size"          // mimo_audio: sliding-window radius
+#define KEY_A_LOCAL_BLOCK_COUNT   "clip.audio.local_block_count"    // mimo_audio: input_local_transformer layers
+#define KEY_A_LOCAL_GROUP_SIZE    "clip.audio.local_group_size"     // mimo_audio: input_local_transformer group size
 
 
 //
@@ -73,6 +81,7 @@
 #define TN_ATTN_OUTPUT     "%s.blk.%d.attn_out.%s"
 #define TN_ATTN_K_NORM     "%s.blk.%d.attn_k_norm.%s"
 #define TN_ATTN_Q_NORM     "%s.blk.%d.attn_q_norm.%s"
+#define TN_ATTN_SINKS      "%s.blk.%d.attn_sinks"
 #define TN_FFN_DOWN        "%s.blk.%d.ffn_down.%s"
 #define TN_FFN_UP          "%s.blk.%d.ffn_up.%s"
 #define TN_FFN_GATE        "%s.blk.%d.ffn_gate.%s"
@@ -125,6 +134,22 @@
 // ultravox
 #define TN_CONV1D       "a.conv1d.%d.%s"
 #define TN_MM_AUDIO_MLP "mm.a.mlp.%d.%s"
+// mimo_audio: audio tokenizer encoder (post-transformer downsample + RVQ codebook)
+#define TN_A_DOWNSAMPLE_CONV   "a.downsample.conv.%s"
+#define TN_A_DOWNSAMPLE_NORM   "a.downsample.norm.%s"
+#define TN_A_RVQ_CODEBOOK      "a.rvq.codebook.%s"
+// mimo_audio: LLM-side code embedding + input_local_transformer
+#define TN_MM_A_CODE_EMBD      "mm.a.code_embd.%s"
+#define TN_MM_A_LOCAL_ATTN_Q   "mm.a.local_blk.%d.attn_q.%s"
+#define TN_MM_A_LOCAL_ATTN_K   "mm.a.local_blk.%d.attn_k.%s"
+#define TN_MM_A_LOCAL_ATTN_V   "mm.a.local_blk.%d.attn_v.%s"
+#define TN_MM_A_LOCAL_ATTN_OUT "mm.a.local_blk.%d.attn_out.%s"
+#define TN_MM_A_LOCAL_FFN_GATE "mm.a.local_blk.%d.ffn_gate.%s"
+#define TN_MM_A_LOCAL_FFN_UP   "mm.a.local_blk.%d.ffn_up.%s"
+#define TN_MM_A_LOCAL_FFN_DOWN "mm.a.local_blk.%d.ffn_down.%s"
+#define TN_MM_A_LOCAL_LN1      "mm.a.local_blk.%d.ln1.%s"
+#define TN_MM_A_LOCAL_LN2      "mm.a.local_blk.%d.ln2.%s"
+#define TN_MM_A_LOCAL_NORM     "mm.a.local_norm.%s"
 #define TN_MM_AUDIO_FC  "mm.a.fc.%s" // fully connected layer
 #define TN_MM_NORM_PRE  "mm.a.norm_pre.%s"
 #define TN_MM_NORM_MID  "mm.a.norm_mid.%s"
@@ -191,6 +216,8 @@ enum projector_type {
     PROJECTOR_TYPE_MINIMAX_M3_VL,
     PROJECTOR_TYPE_DEEPSEEK4V,
     PROJECTOR_TYPE_DEEPSEEK41,
+    PROJECTOR_TYPE_MIMOVL,
+    PROJECTOR_TYPE_MIMO_AUDIO,
     PROJECTOR_TYPE_UNKNOWN,
 
 };
@@ -225,6 +252,8 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_MINIMAX_M3_VL, "minimax_m3_vl"},
     { PROJECTOR_TYPE_DEEPSEEK4V, "deepseek4v"},
     { PROJECTOR_TYPE_DEEPSEEK41, "deepseek41"},
+    { PROJECTOR_TYPE_MIMOVL,    "mimovl"},
+    { PROJECTOR_TYPE_MIMO_AUDIO,"mimo_audio"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {

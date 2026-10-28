@@ -278,7 +278,7 @@ struct mtmd_context {
             // https://github.com/huggingface/transformers/blob/1cd110c6cb6a6237614130c470e9a902dbc1a4bd/docs/source/en/model_doc/pixtral.md
             img_end = "[IMG_END]";
 
-        } else if (proj == PROJECTOR_TYPE_QWEN2VL || proj == PROJECTOR_TYPE_QWEN25VL || proj == PROJECTOR_TYPE_QWEN3VL || proj == PROJECTOR_TYPE_LING3VL) {
+        } else if (proj == PROJECTOR_TYPE_QWEN2VL || proj == PROJECTOR_TYPE_QWEN25VL || proj == PROJECTOR_TYPE_QWEN3VL || proj == PROJECTOR_TYPE_LING3VL || proj == PROJECTOR_TYPE_MIMOVL) {
             // <|vision_start|> ... (image embeddings) ... <|vision_end|>
             img_beg = "<|vision_start|>";
             img_end = "<|vision_end|>";
@@ -353,6 +353,10 @@ struct mtmd_context {
             // [BEGIN_AUDIO] ... (embeddings) ...
             aud_beg = "[BEGIN_AUDIO]";
 
+        } else if (proj == PROJECTOR_TYPE_MIMO_AUDIO) {
+            // <|mimo_audio_start|> ... (embeddings) ... <|mimo_audio_end|>
+            aud_beg = "<|mimo_audio_start|>";
+            aud_end = "<|mimo_audio_end|>";
         }
     }
 
@@ -694,11 +698,16 @@ struct mtmd_tokenizer {
             }
 
             // preprocess audio
-            GGML_ASSERT(ctx->w_filters.n_mel); // make sure we have filter preloaded
             std::vector<whisper_preprocessor::whisper_mel> mel_spec_chunks;
             const float * samples = (const float *)bitmap->data.data();
             size_t n_samples = bitmap->data.size() / sizeof(float);
-            bool ok = whisper_preprocessor::preprocess_audio(samples, n_samples, ctx->w_filters, mel_spec_chunks);
+            bool ok;
+            if (clip_get_projector_type(ctx->ctx_a) == PROJECTOR_TYPE_MIMO_AUDIO) {
+                ok = mimo_audio_preprocessor::preprocess_audio(samples, n_samples, clip_get_n_mel_bins(ctx->ctx_a), mel_spec_chunks);
+            } else {
+                GGML_ASSERT(ctx->w_filters.n_mel); // make sure we have filter preloaded
+                ok = whisper_preprocessor::preprocess_audio(samples, n_samples, ctx->w_filters, mel_spec_chunks);
+            }
             if (!ok) {
                 LOG_ERR("Unable to preprocess audio\n");
                 return 2;
@@ -914,8 +923,11 @@ int mtmd_get_audio_bitrate(mtmd_context * ctx) {
     if (!ctx->ctx_a) {
         return -1;
     }
-    // for now, we assume that all audio models have the same bitrate
-    return 16000; // 16kHz
+    if (clip_get_projector_type(ctx->ctx_a) == PROJECTOR_TYPE_MIMO_AUDIO) {
+        return mimo_audio_preprocessor::SAMPLE_RATE; // 24kHz
+    }
+    // other audio models use whisper-style 16kHz input
+    return 16000;
 }
 
 //

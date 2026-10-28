@@ -767,3 +767,199 @@ whisper_preprocessor::whisper_filters get_128_bins() {
 }
 
 } // namespace whisper_precalc_filters
+
+// MiMo audio (MiMo-V2.5 / V2.6)
+//
+// Derived from torchaudio.transforms.MelSpectrogram(sample_rate=24000, n_fft=960, hop_length=240,
+// win_length=960, n_mels=128, power=1.0, center=True, pad_mode="reflect", norm=None,
+// mel_scale="htk") followed by log(clamp(spec, min=1e-7)).
+//
+namespace mimo_audio_preprocessor {
+
+namespace {
+
+struct fft_cache {
+    int n = 0;
+    std::vector<float> sin_vals, cos_vals; // 2*pi*i/n
+    std::vector<float> hann;               // periodic
+    std::vector<float> filters;            // [n_mel, n_fft/2 + 1]
+};
+
+// real-input DFT, out is interleaved complex [N]
+void dft(const fft_cache & c, const float * in, int N, float * out) {
+    const int step = c.n / N;
+    for (int k = 0; k < N; k++) {
+        float re = 0, im = 0;
+        for (int n = 0; n < N; n++) {
+            const int idx = (k * n * step) % c.n;
+            re += in[n] * c.cos_vals[idx];
+            im -= in[n] * c.sin_vals[idx];
+        }
+        out[2*k + 0] = re;
+        out[2*k + 1] = im;
+    }
+}
+
+// recursive radix-2 real-input FFT, odd sizes fall back to the DFT (960 = 2^6 * 15)
+// `in` needs room for 2*N floats of scratch, `out` for 8*N
+void fft(const fft_cache & c, float * in, int N, float * out) {
+    if (N == 1) {
+        out[0] = in[0];
+        out[1] = 0.0f;
+        return;
+    }
+    const int half = N / 2;
+    if (N - half * 2 == 1) {
+        dft(c, in, N, out);
+        return;
+    }
+    float * even = in + N;
+    for (int i = 0; i < half; ++i) even[i] = in[2*i];
+    float * even_fft = out + 2*N;
+    fft(c, even, half, even_fft);
+
+    float * odd = even;
+    for (int i = 0; i < half; ++i) odd[i] = in[2*i + 1];
+    float * odd_fft = even_fft + N;
+    fft(c, odd, half, odd_fft);
+
+    const int step = c.n / N;
+    for (int k = 0; k < half; k++) {
+        const float re = c.cos_vals[k * step];
+        const float im = -c.sin_vals[k * step];
+        const float re_odd = odd_fft[2*k + 0];
+        const float im_odd = odd_fft[2*k + 1];
+        out[2*k + 0]          = even_fft[2*k + 0] + re*re_odd - im*im_odd;
+        out[2*k + 1]          = even_fft[2*k + 1] + re*im_odd + im*re_odd;
+        out[2*(k + half) + 0] = even_fft[2*k + 0] - re*re_odd + im*im_odd;
+        out[2*(k + half) + 1] = even_fft[2*k + 1] - re*im_odd - im*re_odd;
+    }
+}
+
+const fft_cache & get_cache(int n_mel) {
+    static fft_cache c;
+    if (c.n == N_FFT && (int) c.filters.size() == n_mel * (N_FFT/2 + 1)) {
+        return c;
+    }
+    c.n = N_FFT;
+    c.sin_vals.resize(N_FFT);
+    c.cos_vals.resize(N_FFT);
+    for (int i = 0; i < N_FFT; i++) {
+        const double theta = (2 * M_PI * i) / N_FFT;
+        c.sin_vals[i] = sin(theta);
+        c.cos_vals[i] = cos(theta);
+    }
+    c.hann.resize(WIN_LEN);
+    for (int i = 0; i < WIN_LEN; i++) {
+        c.hann[i] = 0.5 * (1.0 - cos((2.0 * M_PI * i) / WIN_LEN));
+    }
+
+    // HTK mel filterbank, no area normalization, fmin = 0, fmax = sr/2
+    const int n_bins = N_FFT/2 + 1;
+    auto hz_to_mel = [](double f) { return 2595.0 * log10(1.0 + f / 700.0); };
+    auto mel_to_hz = [](double m) { return 700.0 * (pow(10.0, m / 2595.0) - 1.0); };
+    const double m_lo = hz_to_mel(0.0);
+    const double m_hi = hz_to_mel(SAMPLE_RATE / 2.0);
+    std::vector<double> hz(n_mel + 2);
+    for (int i = 0; i < n_mel + 2; i++) {
+        hz[i] = mel_to_hz(m_lo + (m_hi - m_lo) * (double(i) / (n_mel + 1)));
+    }
+    c.filters.assign((size_t) n_mel * n_bins, 0.0f);
+    const double bin_hz = double(SAMPLE_RATE) / N_FFT;
+    for (int m = 0; m < n_mel; m++) {
+        const double fl = hz[m], fc = hz[m + 1], fr = hz[m + 2];
+        for (int k = 0; k < n_bins; k++) {
+            const double f = k * bin_hz;
+            double w = 0.0;
+            if (f >= fl && f <= fc) {
+                w = (f - fl) / std::max(1e-30, fc - fl);
+            } else if (f > fc && f <= fr) {
+                w = (fr - f) / std::max(1e-30, fr - fc);
+            }
+            c.filters[(size_t) m * n_bins + k] = (float) w;
+        }
+    }
+    return c;
+}
+
+// one clip -> [n_mel, n_frames] log-mel, n_frames = 1 + n_samples / HOP_LEN
+bool mel_one(const fft_cache & c, const float * samples, int n_samples, int n_mel, whisper_preprocessor::whisper_mel & out) {
+    const int pad = N_FFT / 2;
+    if (n_samples <= pad) {
+        // too short for reflect padding: zero-extend so we still produce a frame
+        std::vector<float> tmp(pad + 1, 0.0f);
+        std::copy(samples, samples + n_samples, tmp.begin());
+        return mel_one(c, tmp.data(), (int) tmp.size(), n_mel, out);
+    }
+
+    std::vector<float> padded(n_samples + 2 * pad);
+    for (int i = 0; i < pad; i++) {
+        padded[i] = samples[pad - i];
+        padded[n_samples + pad + i] = samples[n_samples - 2 - i];
+    }
+    std::copy(samples, samples + n_samples, padded.begin() + pad);
+
+    const int n_bins   = N_FFT/2 + 1;
+    const int n_frames = (int) (padded.size() - N_FFT) / HOP_LEN + 1;
+    out.n_mel     = n_mel;
+    out.n_len     = n_frames;
+    out.n_len_org = n_samples;
+    out.data.assign((size_t) n_mel * n_frames, 0.0f);
+
+    const int n_threads = std::max(1, std::min(8, (int) std::thread::hardware_concurrency()));
+    auto worker = [&](int ith) {
+        std::vector<float> fin(N_FFT * 2, 0.0f);
+        std::vector<float> fout(N_FFT * 8);
+        std::vector<float> mag(n_bins);
+        for (int t = ith; t < n_frames; t += n_threads) {
+            const float * x = padded.data() + (size_t) t * HOP_LEN;
+            for (int j = 0; j < N_FFT; j++) {
+                fin[j] = x[j] * c.hann[j];
+            }
+            fft(c, fin.data(), N_FFT, fout.data());
+            for (int j = 0; j < n_bins; j++) {
+                mag[j] = sqrtf(fout[2*j]*fout[2*j] + fout[2*j + 1]*fout[2*j + 1]);
+            }
+            for (int m = 0; m < n_mel; m++) {
+                const float * fb = c.filters.data() + (size_t) m * n_bins;
+                double sum = 0.0;
+                for (int j = 0; j < n_bins; j++) {
+                    sum += mag[j] * fb[j];
+                }
+                out.data[(size_t) m * n_frames + t] = (float) log(std::max(sum, 1e-7));
+            }
+        }
+    };
+    std::vector<std::thread> threads;
+    for (int i = 1; i < n_threads; i++) {
+        threads.emplace_back(worker, i);
+    }
+    worker(0);
+    for (auto & th : threads) {
+        th.join();
+    }
+    return true;
+}
+
+}
+
+bool preprocess_audio(const float * samples, size_t n_samples, int n_mel,
+                      std::vector<whisper_preprocessor::whisper_mel> & output) {
+    if (n_samples == 0 || n_mel <= 0) {
+        return false;
+    }
+    const fft_cache & c = get_cache(n_mel);
+    // the tokenizer is trained on clips of at most MAX_SECONDS: split longer audio
+    const size_t chunk = (size_t) SAMPLE_RATE * MAX_SECONDS;
+    for (size_t off = 0; off < n_samples; off += chunk) {
+        const size_t n = std::min(chunk, n_samples - off);
+        whisper_preprocessor::whisper_mel mel;
+        if (!mel_one(c, samples + off, (int) n, n_mel, mel)) {
+            return false;
+        }
+        output.push_back(std::move(mel));
+    }
+    return true;
+}
+
+}
