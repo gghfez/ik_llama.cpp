@@ -962,4 +962,33 @@ bool preprocess_audio(const float * samples, size_t n_samples, int n_mel,
     return true;
 }
 
+} // namespace mimo_audio_preprocessor
+
+namespace gemma4ua_preprocessor {
+
+bool preprocess_audio(const float * samples, size_t n_samples, int frame_size,
+                      std::vector<whisper_preprocessor::whisper_mel> & output) {
+    if (n_samples == 0 || frame_size <= 0) {
+        return false;
+    }
+    // Gemma4UnifiedAudioFeatureExtractor keeps the whole clip as one sequence (no 30 s chunking)
+    const int n_tokens = (int) ((n_samples + frame_size - 1) / frame_size);
+
+    whisper_preprocessor::whisper_mel mel;
+    mel.n_len     = n_tokens;
+    mel.n_len_org = n_tokens;
+    mel.n_mel     = frame_size;
+    mel.data.assign((size_t) frame_size * n_tokens, 0.0f);
+    for (int t = 0; t < n_tokens; t++) {
+        for (int f = 0; f < frame_size; f++) {
+            const size_t src = (size_t) t * frame_size + f;
+            if (src < n_samples) {
+                mel.data[(size_t) f * n_tokens + t] = samples[src];
+            }
+        }
+    }
+    output.push_back(std::move(mel));
+    return true;
 }
+
+} // namespace gemma4ua_preprocessor

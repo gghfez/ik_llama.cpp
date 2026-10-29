@@ -456,6 +456,13 @@ struct clip_model {
     // gemma4
     ggml_tensor * std_bias = nullptr;
     ggml_tensor * std_scale = nullptr;
+    // gemma4uv: LayerNorms around the patch projection, and after the position embedding
+    ggml_tensor * patch_norm_1_w = nullptr;
+    ggml_tensor * patch_norm_1_b = nullptr;
+    ggml_tensor * patch_norm_2_w = nullptr;
+    ggml_tensor * patch_norm_2_b = nullptr;
+    ggml_tensor * patch_norm_3_w = nullptr;
+    ggml_tensor * patch_norm_3_b = nullptr;
     // Gemma4ClippableLinear
     struct clamp_info {
         float inp_max;
@@ -2181,6 +2188,74 @@ struct clip_graph {
         return gf;
     }
 
+    // Gemma4UnifiedMultimodalEmbedder: RMSNorm (no scale) -> Linear (no bias)
+    ggml_tensor * build_gemma4_unified_embedder(ggml_tensor * cur) {
+        cur = ggml_rms_norm(ctx0, cur, hparams.eps);
+        cur = ggml_mul_mat(ctx0, model.mm_input_proj_w, cur);
+        cb(cur, "projected", -1);
+        return cur;
+    }
+
+    // Gemma4UnifiedVisionEmbedder (encoder-free): each 48x48 patch is one token
+    // raw_patches -> LN1 -> Dense -> LN2 -> + factorized posemb -> LN3 -> RMSNorm -> Linear
+    ggml_cgraph * build_gemma4uv() {
+        ggml_tensor * inp_raw = build_inp_raw();
+
+        // nn.LayerNorm default eps, not the RMSNorm eps from the GGUF
+        const float ln_eps = 1e-5f;
+
+        // im2col instead of conv_2d because LN1 runs on the raw patch before the projection.
+        // im2col yields CHW order within a patch; the converter permutes LN1 and the dense
+        // weight columns (HF order is HWC) to match.
+        ggml_tensor * kernel = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, patch_size, patch_size, inp_raw->ne[2]);
+        ggml_tensor * inp = ggml_im2col(ctx0, kernel, inp_raw, patch_size, patch_size, 0, 0, 1, 1, true, GGML_TYPE_F32);
+        // [patch_size*patch_size*c, n_patches_x, n_patches_y] -> [patch_size*patch_size*c, n_patches]
+        inp = ggml_reshape_2d(ctx0, inp, inp->ne[0], inp->ne[1] * inp->ne[2] * inp->ne[3]);
+        inp = build_norm(inp, model.patch_norm_1_w, model.patch_norm_1_b, NORM_TYPE_NORMAL, ln_eps, -1);
+        inp = ggml_mul_mat(ctx0, model.patch_embeddings_0, inp);
+        inp = ggml_add(ctx0, inp, model.patch_bias);
+        inp = build_norm(inp, model.patch_norm_2_w, model.patch_norm_2_b, NORM_TYPE_NORMAL, ln_eps, -1);
+        cb(inp, "patch_embd", -1);
+
+        ggml_tensor * pos_x = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
+        ggml_set_name(pos_x, "pos_x");
+        ggml_set_input(pos_x);
+
+        ggml_tensor * pos_y = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
+        ggml_set_name(pos_y, "pos_y");
+        ggml_set_input(pos_y);
+
+        {
+            // pos_embedding is (posemb_size, 2, n_embd) in HF, stored as [n_embd, posemb_size, 2]:
+            // table 0 is indexed by x (column), table 1 by y (row)
+            const int64_t pos_size = model.position_embeddings->ne[1];
+            const size_t  nb1      = ggml_row_size(model.position_embeddings->type, n_embd);
+            ggml_tensor * tbl_x = ggml_view_2d(ctx0, model.position_embeddings, n_embd, pos_size, nb1, 0);
+            ggml_tensor * tbl_y = ggml_view_2d(ctx0, model.position_embeddings, n_embd, pos_size, nb1, pos_size * nb1);
+
+            inp = ggml_add(ctx0, inp, ggml_get_rows(ctx0, tbl_x, pos_x));
+            inp = ggml_add(ctx0, inp, ggml_get_rows(ctx0, tbl_y, pos_y));
+            cb(inp, "pos_embd", -1);
+
+            inp = build_norm(inp, model.patch_norm_3_w, model.patch_norm_3_b, NORM_TYPE_NORMAL, ln_eps, -1);
+        }
+
+        ggml_tensor * cur = build_gemma4_unified_embedder(inp);
+        ggml_build_forward_expand(gf, cur);
+        return gf;
+    }
+
+    // Gemma4Unified audio (encoder-free): each 640-sample raw waveform frame is one token
+    ggml_cgraph * build_gemma4ua() {
+        // [n_frames, frame_size] -> [frame_size, n_frames]
+        ggml_tensor * inp = build_inp_raw(1);
+        ggml_tensor * cur = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, inp, inp->ne[0], inp->ne[1])));
+
+        cur = build_gemma4_unified_embedder(cur);
+        ggml_build_forward_expand(gf, cur);
+        return gf;
+    }
+
     ggml_cgraph * build_minicpmv() {
         const int batch_size = 1;
 
@@ -3827,6 +3902,14 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             {
                 res = graph.build_gemma4();
             } break;
+        case PROJECTOR_TYPE_GEMMA4UV:
+            {
+                res = graph.build_gemma4uv();
+            } break;
+        case PROJECTOR_TYPE_GEMMA4UA:
+            {
+                res = graph.build_gemma4ua();
+            } break;
         case PROJECTOR_TYPE_MINICPMV:
             {
                 res = graph.build_minicpmv();
@@ -4349,6 +4432,25 @@ struct clip_model_loader {
                         hparams.set_limit_image_tokens(252, 280);
                         hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
                     } break;
+                case PROJECTOR_TYPE_GEMMA4UV:
+                    {
+                        // encoder-free: the 3x3 merge of 16px patches is a single 48px patch (model_patch_size)
+                        int32_t pooling_kernel = 3;
+                        get_u32(KEY_PROJ_SCALE_FACTOR, pooling_kernel, false);
+                        hparams.patch_size *= pooling_kernel;
+                        hparams.n_merge = 1;
+                        // HF processor: max_soft_tokens = 280 (override with --image-max-tokens);
+                        // images are resized up or down to fill that budget, so no minimum applies
+                        hparams.set_limit_image_tokens(1, 280);
+                        hparams.set_warmup_n_tokens(256);
+                    } break;
+                case PROJECTOR_TYPE_GEMMA4UA:
+                    {
+                        // encoder-free: raw 16 kHz waveform in 640-sample (40 ms) frames;
+                        // n_mel_bins holds the frame size (the GGUF value is a meaningless 128)
+                        hparams.n_mel_bins = 640;
+                        hparams.eps        = 1e-6f;
+                    } break;
                 case PROJECTOR_TYPE_LLAMA4:
                     {
                         hparams.rope_theta = 10000.0f;
@@ -4755,6 +4857,21 @@ struct clip_model_loader {
                 {
                     model.mm_input_proj_w = get_tensor(TN_MM_INP_PROJ);
                     model.mm_soft_emb_norm_w = get_tensor(TN_MM_SOFT_EMB_N);
+                } break;
+            case PROJECTOR_TYPE_GEMMA4UV:
+                {
+                    model.mm_input_proj_w = get_tensor(TN_MM_INP_PROJ);
+                    model.patch_norm_1_w  = get_tensor(string_format(TN_PATCH_NORM, 1, "weight"));
+                    model.patch_norm_1_b  = get_tensor(string_format(TN_PATCH_NORM, 1, "bias"));
+                    model.patch_norm_2_w  = get_tensor(string_format(TN_PATCH_NORM, 2, "weight"));
+                    model.patch_norm_2_b  = get_tensor(string_format(TN_PATCH_NORM, 2, "bias"));
+                    model.patch_norm_3_w  = get_tensor(string_format(TN_PATCH_NORM, 3, "weight")); // pos_norm
+                    model.patch_norm_3_b  = get_tensor(string_format(TN_PATCH_NORM, 3, "bias"));
+                    GGML_ASSERT(model.patch_embeddings_0 && model.patch_bias && model.position_embeddings);
+                } break;
+            case PROJECTOR_TYPE_GEMMA4UA:
+                {
+                    model.mm_input_proj_w = get_tensor(string_format(TN_A_MM_INP_PROJ, "weight"));
                 } break;
             case PROJECTOR_TYPE_GEMMA4V:
                 {
@@ -5891,6 +6008,39 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
                 res_imgs->entries.push_back(std::move(img_f32));
             } break;
 
+        case PROJECTOR_TYPE_GEMMA4UV:
+            {
+                // Gemma4UnifiedImageProcessor.get_aspect_ratio_preserving_size: scale (up or down) to the
+                // max_soft_tokens pixel budget, then floor each side to a multiple of the 48px model patch
+                const int side_mult  = params.patch_size; // patch_size * pooling_kernel_size
+                const int max_tokens = params.image_max_pixels / (side_mult * side_mult);
+                const int max_side   = std::min(max_tokens, (int) ctx->model.position_embeddings->ne[1]) * side_mult;
+                const double target_px = (double) max_tokens * side_mult * side_mult;
+                const double factor = std::sqrt(target_px / ((double) original_size.width * original_size.height));
+                int tw = (int) std::floor(factor * original_size.width  / side_mult) * side_mult;
+                int th = (int) std::floor(factor * original_size.height / side_mult) * side_mult;
+                if (tw == 0 && th == 0) {
+                    LOG_ERR("%s: image too small to resize: %d x %d\n", __func__, original_size.width, original_size.height);
+                    return false;
+                }
+                if (th == 0) {
+                    th = side_mult;
+                    tw = std::min(original_size.width / original_size.height * side_mult, max_side);
+                } else if (tw == 0) {
+                    tw = side_mult;
+                    th = std::min(original_size.height / original_size.width * side_mult, max_side);
+                }
+                // stays inside the learned position table (only reachable via a custom --image-max-tokens)
+                tw = std::min(tw, max_side);
+                th = std::min(th, max_side);
+
+                clip_image_u8 resized;
+                img_tool::resize(*img, resized, clip_image_size{tw, th}, img_tool::RESIZE_ALGO_BICUBIC, false);
+                clip_image_f32_ptr img_f32(clip_image_f32_init());
+                normalize_image_u8_to_f32(resized, *img_f32, params.image_mean, params.image_std); // x / 255
+                res_imgs->entries.push_back(std::move(img_f32));
+            } break;
+
         case PROJECTOR_TYPE_IDEFICS3:
             {
                 // The refined size has two steps:
@@ -6397,6 +6547,7 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
         case PROJECTOR_TYPE_INTERNVL:
         case PROJECTOR_TYPE_LLAMA4:
         case PROJECTOR_TYPE_GEMMA4V:
+        case PROJECTOR_TYPE_GEMMA4UV:
             {
                 // both X and Y are downscaled by the scale factor
                 int scale_factor = ctx->model.hparams.n_merge;
@@ -6424,6 +6575,10 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
                 } else {
                     n_patches = n_patches_y * n_patches_x;
                 }
+            } break;
+        case PROJECTOR_TYPE_GEMMA4UA:
+            {
+                n_patches = img->nx; // one token per raw waveform frame
             } break;
         case PROJECTOR_TYPE_MIMO_AUDIO:
             {
@@ -6744,6 +6899,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 set_input_i32("positions", positions);
             } break;
         case PROJECTOR_TYPE_GEMMA4V:
+        case PROJECTOR_TYPE_GEMMA4UV:
             {
                 // set (col, row) patch positions for learned positional embedding
                 // what about image_size_height?
@@ -7070,6 +7226,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         case PROJECTOR_TYPE_VOXTRAL:
         case PROJECTOR_TYPE_JANUS_PRO:
         case PROJECTOR_TYPE_COGVLM:
+        case PROJECTOR_TYPE_GEMMA4UA:
             {
                 // do nothing
             } break;
@@ -7225,6 +7382,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_GEMMA3:
             return ctx->model.mm_input_proj_w->ne[0];
         case PROJECTOR_TYPE_GEMMA4V:
+        case PROJECTOR_TYPE_GEMMA4UV:
+        case PROJECTOR_TYPE_GEMMA4UA:
             return ctx->model.mm_input_proj_w->ne[1];
         case PROJECTOR_TYPE_IDEFICS3:
             return ctx->model.projection->ne[1];

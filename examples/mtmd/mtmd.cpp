@@ -306,7 +306,7 @@ struct mtmd_context {
             img_end = "<|im_end|>";
 
         }
-        else if (proj == PROJECTOR_TYPE_GEMMA4V) {
+        else if (proj == PROJECTOR_TYPE_GEMMA4V || proj == PROJECTOR_TYPE_GEMMA4UV) {
             // <|image> ... (image embeddings) ... <image|>
             img_beg = "<|image>";
             img_end = "<image|>";
@@ -352,6 +352,11 @@ struct mtmd_context {
         } else if (proj == PROJECTOR_TYPE_ULTRAVOX) {
             // [BEGIN_AUDIO] ... (embeddings) ...
             aud_beg = "[BEGIN_AUDIO]";
+
+        } else if (proj == PROJECTOR_TYPE_GEMMA4UA) {
+            // <|audio> ... (embeddings) ... <audio|>
+            aud_beg = "<|audio>";
+            aud_end = "<audio|>";
 
         } else if (proj == PROJECTOR_TYPE_MIMO_AUDIO) {
             // <|mimo_audio_start|> ... (embeddings) ... <|mimo_audio_end|>
@@ -704,6 +709,8 @@ struct mtmd_tokenizer {
             bool ok;
             if (clip_get_projector_type(ctx->ctx_a) == PROJECTOR_TYPE_MIMO_AUDIO) {
                 ok = mimo_audio_preprocessor::preprocess_audio(samples, n_samples, clip_get_n_mel_bins(ctx->ctx_a), mel_spec_chunks);
+            } else if (clip_get_projector_type(ctx->ctx_a) == PROJECTOR_TYPE_GEMMA4UA) {
+                ok = gemma4ua_preprocessor::preprocess_audio(samples, n_samples, clip_get_n_mel_bins(ctx->ctx_a), mel_spec_chunks);
             } else {
                 GGML_ASSERT(ctx->w_filters.n_mel); // make sure we have filter preloaded
                 ok = whisper_preprocessor::preprocess_audio(samples, n_samples, ctx->w_filters, mel_spec_chunks);
@@ -900,7 +907,7 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
 
 bool mtmd_decode_use_non_causal(mtmd_context * ctx) {
     if (ctx->ctx_v) {
-        if (auto type = clip_get_projector_type(ctx->ctx_v); type == PROJECTOR_TYPE_GEMMA3 || type == PROJECTOR_TYPE_GEMMA4V || type == PROJECTOR_TYPE_DEEPSEEK4V) {
+        if (auto type = clip_get_projector_type(ctx->ctx_v); type == PROJECTOR_TYPE_GEMMA3 || type == PROJECTOR_TYPE_GEMMA4V || type == PROJECTOR_TYPE_GEMMA4UV || type == PROJECTOR_TYPE_DEEPSEEK4V) {
             return true;
         }
     }
