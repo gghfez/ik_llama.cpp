@@ -150,6 +150,10 @@ static json format_final_response_oaicompat(const json& request, json result, co
         res["completion_probabilities"] = json_value(result, "completion_probabilities", json::array());
     }
 
+    if (result.contains("jlens_probabilities")) {
+        res["jlens_probabilities"] = json_value(result, "jlens_probabilities", json::array());
+    }
+
     return res;
 }
 

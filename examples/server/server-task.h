@@ -48,6 +48,22 @@ enum oaicompat_type {
     OAICOMPAT_TYPE_RESP,
 };
 
+enum jlens_edit_mode {
+    JLENS_EDIT_ADD,
+    JLENS_EDIT_SET,
+    JLENS_EDIT_LOWRANK,
+};
+
+struct jlens_edit {
+    int32_t layer     = -1;
+    int32_t pos_start = 0;   // inclusive
+    int32_t pos_end   = -1;  // exclusive; -1 = unbounded
+    enum jlens_edit_mode mode = JLENS_EDIT_ADD;
+    bool    rel = false;     // ADD only: scale `a` by the edited row's own residual norm
+    int32_t k   = 0;         // LOWRANK rank
+    std::vector<float> a;    // [n_embd] (add/set), or A [n_embd, k] row-major (lowrank)
+    std::vector<float> b;    // B [k, n_embd] row-major (lowrank only)
+};
 
 struct slot_params {
     bool stream = true;
@@ -66,6 +82,25 @@ struct slot_params {
     bool post_sampling_probs = false;
     json input_prefix;
     json input_suffix;
+
+    // Jacobian-lens readout (requires the server started with --jlens)
+    int32_t              jlens_n_probs = 0;
+    bool                 jlens_use_jacobian = true; // false = logit-lens
+    std::vector<int32_t> jlens_layers; // empty = all
+
+    bool                 jlens_mask        = true;
+    bool                 jlens_mask_custom = false;
+    jlens_token_mask     jlens_mask_ids;
+    bool                 jlens_mask_renorm = false;
+    uint32_t             jlens_mask_special = 0;
+
+    // Jacobian-lens interventions, empty = none
+    std::vector<jlens_edit> jlens_edits;
+
+    // Jacobian-lens probe of the prompt itself
+    bool    jlens_prompt     = false;
+    int32_t jlens_prompt_pos_start = 0; // inclusive
+    int32_t jlens_prompt_pos_end   = -1; // exclusive; -1 = unbounded
 
     // speculative decoding parameters
     struct common_params_speculative speculative;

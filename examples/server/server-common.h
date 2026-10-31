@@ -254,6 +254,13 @@ struct completion_token_output {
     };
     std::vector<prob_info> probs;
 
+    // Jacobian-lens readout
+    struct layer_probs {
+        int32_t layer;
+        std::vector<prob_info> probs;
+    };
+    std::vector<layer_probs> jlens_layers;
+
     json to_json(bool post_sampling_probs) const;
 
     static float logarithm(float x);
@@ -267,6 +274,45 @@ using completion_token_outputs = std::deque<completion_token_output>;
 
 // convert a vector of completion_token_output to json
 json probs_vector_to_json(const llama_context* ctx, const std::vector<completion_token_output>& probs);
+
+json jlens_vector_to_json(const llama_context* ctx, const std::vector<completion_token_output>& probs);
+
+static constexpr size_t JLENS_MAX_LAYER_SPEC = 4096;
+
+bool jlens_parse_layers(const json& spec, std::vector<int32_t>& out, std::string& err);
+
+// Token categories a request can hide from jlens readouts with "jlens_mask_special"
+// (true = all of them, or a name / list of names).
+enum jlens_special_category : uint32_t {
+    JLENS_SPECIAL_CONTROL      = 1u << 0, // control tokens: bos/eos/pad, chat turn and media markers
+    JLENS_SPECIAL_UNUSED       = 1u << 1, // reserved slots: UNUSED attr, or <unusedN> / [PADN] by name
+    JLENS_SPECIAL_USER_DEFINED = 1u << 2, // added tokens such as <think> / <tool_call> / <|channel>
+    JLENS_SPECIAL_BYTE         = 1u << 3, // byte-fallback tokens <0xNN>
+    JLENS_SPECIAL_UNKNOWN      = 1u << 4, // <unk>
+    JLENS_SPECIAL_ALL          = (1u << 5) - 1,
+};
+static constexpr const char * JLENS_SPECIAL_NAMES[] = { "control", "unused", "user_defined", "byte", "unknown" };
+
+// Parse "jlens_mask_special" into a JLENS_SPECIAL_* bitmask.
+bool jlens_parse_special(const json& j, uint32_t& out, std::string& err);
+
+using jlens_token_mask = std::vector<std::vector<llama_token>>;
+
+bool jlens_parse_mask(const json& j, int32_t n_layer, int32_t n_vocab, jlens_token_mask& out, std::string& err);
+
+// A Jacobian-lens readout at one prompt position. `tok` is the token *at* that
+// position; the readout is what the lens sees in that position's residual stream.
+//
+// A media position (an image or audio embedding) has no token: `tok` is
+// LLAMA_TOKEN_NULL and `media` names the chunk type ("image" / "audio").
+struct jlens_prompt_output {
+    int32_t     pos;
+    llama_token tok;
+    const char * media = nullptr;
+    std::vector<completion_token_output::layer_probs> layers;
+};
+
+json jlens_prompt_to_json(const llama_context* ctx, const std::vector<jlens_prompt_output>& rows);
 
 bool server_sent_event(httplib::DataSink& sink, const json& data);
 

@@ -415,6 +415,10 @@ struct gpt_params {
 
     std::vector<llama_control_vector_load_info> control_vectors; // control vector with user defined scale
 
+    std::string jlens_file = ""; // pre-fit Jacobian lens gguf
+    std::vector<std::string> jlens_mask_files; // per-layer token ids to hide from jlens readouts (json)
+    int32_t jlens_device = LLAMA_JLENS_DEVICE_AUTO; // -2 = same as lm_head, -1 = CPU, >= 0 = device index
+
     int32_t verbosity                  = 0;
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector

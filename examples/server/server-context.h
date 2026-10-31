@@ -6,8 +6,84 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
+
+
+
+// Residual-stream capture for the Jacobian lens. The eval callback copies the
+// `l_out-<l>` rows of the current decode batch for the lens's fitted layers.
+//
+// llama_decode splits a batch into n_ubatch-sized chunks and evaluates the graph
+// once per chunk, so the callback fires once per layer *per ubatch*, each time
+// carrying only that ubatch's rows. The buffers therefore accumulate: each layer
+// keeps a cursor (`rows_seen`) and appends, so that after the decode returns,
+// data[layer] is indexed by row in the decoded batch view - which is what
+// populate_jlens_probs()'s idx refers to.
+struct jlens_capture {
+    bool   want   = false;                        // set per-decode when any slot needs jlens
+    int    n_embd = 0;
+    size_t n_rows = 0;                            // rows in the batch view being decoded
+    std::vector<char> is_layer;                   // membership by layer id (fitted source layers)
+    std::unordered_map<int, std::vector<float>> data;      // layer id -> [n_rows * n_embd], batch-view order
+    std::unordered_map<int, size_t>             rows_seen; // layer id -> rows appended so far this decode
+
+    // --- interventions ---------------------------------------------------
+    // Edits are applied in place before the capture, so a readout reports the
+    // residual the model actually went on to use.
+    std::vector<char>    edit_layer;              // layer id -> some slot edits it this decode
+    std::vector<int32_t> row_seq;                 // batch row -> seq id (== slot id)
+    std::vector<int32_t> row_pos;                 // batch row -> sequence position
+    std::unordered_map<int, const std::vector<jlens_edit> *> edits; // seq id -> that slot's edits
+    std::vector<float>   scratch;                 // staging buffer for the edited column span
+
+    // reset the cursors before each decode; the buffers keep their capacity
+    void begin_decode(bool want_, size_t n_rows_) {
+        want   = want_;
+        n_rows = n_rows_;
+        rows_seen.clear();
+        edit_layer.clear();
+        edits.clear();
+        row_seq.clear();
+        row_pos.clear();
+    }
+
+    bool has_edits() const { return !edits.empty(); }
+
+    // register a slot's edit set for this decode
+    void add_edits(int seq_id, const std::vector<jlens_edit> & list) {
+        edits[seq_id] = &list;
+        for (const auto & e : list) {
+            if (e.layer < 0) continue;
+            if ((int) edit_layer.size() <= e.layer) {
+                edit_layer.resize(e.layer + 1, 0);
+            }
+            edit_layer[e.layer] = 1;
+        }
+    }
+
+    // does this row fall inside the edit's position range?
+    static bool edit_covers(const jlens_edit & e, int32_t pos) {
+        return pos >= e.pos_start && (e.pos_end < 0 || pos < e.pos_end);
+    }
+
+    // apply every edit targeting `layer` to the ubatch rows [base_row, base_row+n_tok)
+    void apply_edits(struct ggml_tensor * t, int layer, size_t base_row, size_t n_tok);
+
+    // a layer is usable only if the callback delivered every row of the batch view.
+    // A short buffer means the rows were cropped (the graph gathers only the
+    // logit-requested rows inside the last block, so a lens fitted on the final
+    // block sees fewer rows than it asked for) - skip rather than misindex.
+    const float * row(int layer, size_t idx) const {
+        auto rit = rows_seen.find(layer);
+        if (rit == rows_seen.end() || rit->second != n_rows || idx >= n_rows) return nullptr;
+        auto dit = data.find(layer);
+        if (dit == data.end()) return nullptr;
+        return dit->second.data() + idx * (size_t) n_embd;
+    }
+};
 
 
 
@@ -75,6 +151,8 @@ struct server_slot {
 
     std::vector<completion_token_output> generated_token_probs;
 
+    // Jacobian-lens readouts at prompt positions, accumulated as the prompt is decoded.
+    std::vector<jlens_prompt_output> jlens_prompt_probs;
 
     bool infill = false;
     bool embedding = false;
@@ -123,6 +201,8 @@ struct server_slot {
     bool do_checkpoint = false;
     bool do_rewind_chekpoint = false;
     bool image_just_processed = false;
+
+    uint64_t jlens_cache_hash = 0;
 
     // sampling
     llama_token sampled; // in speculative mode, this is the last accepted token
@@ -243,6 +323,13 @@ struct server_context {
     std::vector<llama_lora_adapter_container> lora_adapters;
     std::vector<control_vector_container> control_vectors;
 
+    // Jacobian lens (optional, loaded via --jlens)
+    struct llama_jlens * jlens = nullptr;
+    std::vector<int32_t> jlens_source_layers;
+    jlens_token_mask     jlens_mask;           // --jlens-mask (all files merged), indexed by layer
+    std::vector<llama_token> jlens_special_ids[std::size(JLENS_SPECIAL_NAMES)]; // per JLENS_SPECIAL_* bit
+    jlens_capture        jlens_cap;
+
     std::vector<std::string> vocab_pieces;
     size_t max_piece_len = 0;
 
@@ -318,6 +405,31 @@ struct server_context {
     bool process_token(completion_token_output& result, server_slot& slot);
 
     void populate_token_probs(const server_slot& slot, completion_token_output& result, bool post_sampling, bool special, int idx);
+
+    void populate_jlens_probs(const server_slot& slot, completion_token_output& result, int idx);
+
+    // the id lists to drop from this slot's readout at `layer`.
+    std::vector<const std::vector<llama_token>*> jlens_masks_for(const server_slot& slot, int32_t layer) const;
+
+    // Top-k of one layer's readout `pv` (probabilities over the vocab) into `lp`.
+    void jlens_top_k(float* pv, int n_vocab, size_t k, const std::vector<const std::vector<llama_token>*>& masks,
+                     bool renorm, std::vector<int>& order, completion_token_output::layer_probs& lp);
+
+    // Read out the prompt rows of the batch that was just decoded.
+    void collect_jlens_prompt_probs(const llama_batch& batch_view);
+
+    void jlens_prompt_readout(server_slot& slot, const std::vector<int32_t>& rows,
+                              const std::vector<int32_t>& poss, const char * media);
+
+    void jlens_media_begin(server_slot& slot, llama_pos pos);
+    void jlens_media_batch_done(server_slot& slot, const llama_batch& batch,
+                                int32_t prompt_idx, const char * media);
+
+    // Parse "jlens_interventions" and resolve semantic ops into edits.
+    bool parse_jlens_edits(const json& data, server_slot& slot, std::string& err);
+
+    // Drop the slot's cached prefix when its intervention set changed.
+    void jlens_sync_slot_cache(server_slot& slot);
 
     json get_formatted_generation(const server_slot& slot) const;
 

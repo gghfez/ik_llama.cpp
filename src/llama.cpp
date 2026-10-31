@@ -10633,6 +10633,501 @@ int32_t llama_control_vector_apply(struct llama_context * lctx, const float * da
     return 0;
 }
 
+//
+// Jacobian lens (jlens)
+//
+
+struct llama_jlens {
+    int32_t d_model   = 0;
+    int32_t n_prompts = 0;
+    std::vector<int32_t> source_layers; // sorted layer ids
+    std::vector<struct ggml_tensor *> tensors; // J_l, parallel to source_layers; ne = [d_model, d_model]
+    std::vector<ggml_context *> ctxs;
+    std::vector<ggml_backend_buffer_t> bufs;
+
+    // private scheduler for the tiny unembed graph.
+    ggml_backend_sched_t sched = nullptr;
+
+    // Persistent scratch for the readout graphs, one buffer per graph kind.
+    std::vector<uint8_t> buf_compute;
+    std::vector<uint8_t> buf_vectors;
+    std::vector<uint8_t> buf_batch;
+
+    ~llama_jlens() {
+        if (sched) { ggml_backend_sched_free(sched); }
+        for (auto * b : bufs) { ggml_backend_buffer_free(b); }
+        for (auto * c : ctxs) { ggml_free(c); }
+    }
+
+    // Size a scratch buffer for the largest graph this lens can produce, hand back a 16-byte-aligned view of it.
+    void graph_buf(std::vector<uint8_t> & buf, void ** mem_buffer, size_t * mem_size) {
+        if (buf.empty()) {
+            const size_t n = source_layers.size();
+            buf.resize(ggml_tensor_overhead() * (n * 8 + 16) + ggml_graph_overhead() + 32);
+        }
+        const uintptr_t raw = (uintptr_t) buf.data();
+        const size_t    off = (16 - (raw % 16)) % 16;
+        *mem_buffer = buf.data() + off;
+        *mem_size   = buf.size() - off;
+    }
+
+    int index_of(int32_t layer) const {
+        auto it = std::lower_bound(source_layers.begin(), source_layers.end(), layer);
+        if (it == source_layers.end() || *it != layer) return -1;
+        return (int)(it - source_layers.begin());
+    }
+};
+
+// Run a jlens readout graph with CUDA graphs off on the context's backends. Avoids memory leak.
+static ggml_status llama_jlens_sched_compute(llama_context * ctx, ggml_backend_sched_t sched, ggml_cgraph * gf) {
+#ifdef GGML_USE_CUDA
+    std::vector<std::pair<ggml_backend_t, bool>> prev;
+    for (auto * b : ctx->backends) {
+        if (ggml_backend_is_cuda(b)) prev.emplace_back(b, ggml_backend_cuda_set_use_graphs(b, false));
+    }
+    const ggml_status st = ggml_backend_sched_graph_compute(sched, gf);
+    for (auto & [b, use] : prev) ggml_backend_cuda_set_use_graphs(b, use);
+    return st;
+#else
+    GGML_UNUSED(ctx);
+    return ggml_backend_sched_graph_compute(sched, gf);
+#endif
+}
+
+struct llama_jlens * llama_jlens_load(const char * path, const struct llama_model * model, int32_t device) {
+    // read the whole gguf into a host ctx first
+    ggml_context * ctx_src = nullptr;
+    struct gguf_init_params gp = { /*.no_alloc =*/ false, /*.ctx =*/ &ctx_src };
+    struct gguf_context * gguf = gguf_init_from_file(path, gp);
+    if (!gguf) {
+        LLAMA_LOG_ERROR("%s: failed to load jlens file %s\n", __func__, path);
+        return nullptr;
+    }
+
+    auto fail = [&](const char * msg) -> llama_jlens * {
+        LLAMA_LOG_ERROR("%s: %s (%s)\n", __func__, msg, path);
+        gguf_free(gguf);
+        ggml_free(ctx_src);
+        return nullptr;
+    };
+
+    const int kid_dmodel = gguf_find_key(gguf, "jlens.d_model");
+    if (kid_dmodel < 0) return fail("missing jlens.d_model (not a jlens gguf?)");
+    const int32_t d_model = gguf_get_val_u32(gguf, kid_dmodel);
+    if (d_model != (int32_t) model->hparams.n_embd) {
+        LLAMA_LOG_ERROR("%s: jlens d_model=%d != model n_embd=%d (%s)\n",
+                __func__, d_model, (int) model->hparams.n_embd, path);
+        gguf_free(gguf);
+        ggml_free(ctx_src);
+        return nullptr;
+    }
+
+    if (model->output == nullptr || model->output_norm == nullptr) {
+        return fail("model has no output / output_norm tensor to unembed through");
+    }
+
+    auto * jl = new llama_jlens();
+    jl->d_model = d_model;
+    const int kid_np = gguf_find_key(gguf, "jlens.n_prompts");
+    if (kid_np >= 0) jl->n_prompts = gguf_get_val_u32(gguf, kid_np);
+
+    // choose j placement
+    ggml_backend_buffer_type_t buft = nullptr;
+    if (device == LLAMA_JLENS_DEVICE_AUTO) {
+        buft = ggml_backend_buffer_get_type(model->output->buffer);
+    } else if (device == LLAMA_JLENS_DEVICE_CPU) {
+        buft = ggml_backend_cpu_buffer_type();
+    } else if (device < 0) {
+        delete jl;
+        return fail("invalid jlens device (expected -2 for auto, -1 for CPU, or a device index)");
+    } else {
+        // Reject J on any other device with no context
+        const bool sm_none = model->split_mode == LLAMA_SPLIT_MODE_NONE;
+        const int  main_id = (model->main_gpu >= 0 && model->main_gpu < (int) model->devices.size())
+                ? model->devices[model->main_gpu] : model->main_gpu;
+        const bool usable  = sm_none
+                ? device == main_id
+                : std::find(model->devices.begin(), model->devices.end(), device) != model->devices.end();
+        if (!usable) {
+            std::string avail;
+            for (int32_t d : model->devices) {
+                if (sm_none && d != main_id) continue;
+                if (!avail.empty()) avail += ", ";
+                avail += std::to_string(d);
+            }
+            LLAMA_LOG_ERROR("%s: jlens device %d is not usable by this model (usable devices: %s) (%s)\n",
+                    __func__, device, avail.empty() ? "none, CPU only" : avail.c_str(), path);
+            delete jl;
+            gguf_free(gguf);
+            ggml_free(ctx_src);
+            return nullptr;
+        }
+        buft = llama_default_buffer_type_offload(*model, device);
+    }
+
+    const int n_tensors = gguf_get_n_tensors(gguf);
+    struct ggml_init_params ip = {
+        /*.mem_size   =*/ (size_t) n_tensors * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx_dst = ggml_init(ip);
+    if (!ctx_dst) { delete jl; return fail("failed to allocate jlens ctx"); }
+
+    // create dst tensors (same shape/type) for every "jlens.J.<layer>"
+    std::vector<std::pair<int32_t, struct ggml_tensor *>> loaded; // (layer, src tensor)
+    for (int i = 0; i < n_tensors; i++) {
+        const char * name = gguf_get_tensor_name(gguf, i);
+        if (strncmp(name, "jlens.J.", 8) != 0) continue;
+        int32_t layer = -1;
+        try { layer = std::stoi(std::string(name + 8)); } catch (...) { layer = -1; }
+        if (layer < 0) { ggml_free(ctx_dst); delete jl; return fail("unparsable jlens.J.<layer> tensor"); }
+
+        struct ggml_tensor * src = ggml_get_tensor(ctx_src, name);
+        if (ggml_n_dims(src) != 2 || src->ne[0] != d_model || src->ne[1] != d_model) {
+            ggml_free(ctx_dst); delete jl;
+            return fail("jlens.J.<layer> must be [d_model, d_model]");
+        }
+        struct ggml_tensor * dst = ggml_new_tensor_2d(ctx_dst, src->type, d_model, d_model);
+        ggml_set_name(dst, name);
+        loaded.emplace_back(layer, src);
+    }
+    if (loaded.empty()) { ggml_free(ctx_dst); delete jl; return fail("no jlens.J tensors found"); }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_dst, buft);
+    if (!buf) { ggml_free(ctx_dst); delete jl; return fail("failed to allocate jlens backend buffer"); }
+    // mark as weights so the scheduler runs J @ h on the lens's own device
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    jl->ctxs.push_back(ctx_dst);
+    jl->bufs.push_back(buf);
+
+    // sort by layer, upload data to backend
+    std::sort(loaded.begin(), loaded.end(),
+              [](const auto & a, const auto & b) { return a.first < b.first; });
+    for (auto & [layer, src] : loaded) {
+        struct ggml_tensor * dst = ggml_get_tensor(ctx_dst, src->name);
+        ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
+        jl->source_layers.push_back(layer);
+        jl->tensors.push_back(dst);
+    }
+
+    LLAMA_LOG_INFO("%s: loaded jlens: d_model=%d, n_prompts=%d, %d layers [%d..%d], buffer=%s\n",
+            __func__, jl->d_model, jl->n_prompts, (int) jl->source_layers.size(),
+            jl->source_layers.front(), jl->source_layers.back(),
+            ggml_backend_buffer_name(buf));
+
+    gguf_free(gguf);
+    ggml_free(ctx_src);
+    return jl;
+}
+
+void llama_jlens_free(struct llama_jlens * jl) { delete jl; }
+
+int32_t llama_jlens_n_layers(const struct llama_jlens * jl) {
+    return jl ? (int32_t) jl->source_layers.size() : 0;
+}
+
+const int32_t * llama_jlens_layers(const struct llama_jlens * jl) {
+    return (jl && !jl->source_layers.empty()) ? jl->source_layers.data() : nullptr;
+}
+
+bool llama_jlens_has_layer(const struct llama_jlens * jl, int32_t layer) {
+    return jl && jl->index_of(layer) >= 0;
+}
+
+bool llama_jlens_compute(
+        struct llama_context * ctx,
+        struct llama_jlens   * jl,
+               const int32_t * layers,
+                     int32_t   n_layers,
+                 const float * residuals,
+                        bool   use_jacobian,
+                       float * out_logits) {
+    if (!ctx || !jl || n_layers <= 0 || !layers || !residuals || !out_logits) return false;
+
+    const llama_model & model = ctx->model;
+    const int64_t n_embd  = model.hparams.n_embd;
+    const int64_t n_vocab = model.hparams.n_vocab;
+
+    // Match the model's final norm.
+    const bool  use_rms = model.hparams.f_norm_rms_eps != 0.0f;
+    const float eps     = use_rms ? model.hparams.f_norm_rms_eps : model.hparams.f_norm_eps;
+
+    // resolve requested layers -> J tensors (only needed when use_jacobian)
+    std::vector<struct ggml_tensor *> Js(n_layers, nullptr);
+    for (int i = 0; i < n_layers; i++) {
+        const int idx = jl->index_of(layers[i]);
+        if (use_jacobian && idx < 0) {
+            LLAMA_LOG_ERROR("%s: layer %d not fitted in this lens\n", __func__, layers[i]);
+            return false;
+        }
+        if (idx >= 0) Js[i] = jl->tensors[idx];
+    }
+
+    // build a small graph for each requested layer, produce unembed(J_l @ h_l)
+    struct ggml_init_params ip = { /*.mem_size =*/ 0, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    jl->graph_buf(jl->buf_compute, &ip.mem_buffer, &ip.mem_size);
+    ggml_context * ctx0 = ggml_init(ip);
+    if (!ctx0) return false;
+
+    struct ggml_tensor * h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_layers);
+    ggml_set_name(h, "jlens_h");
+    ggml_set_input(h);
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+    std::vector<struct ggml_tensor *> outs(n_layers, nullptr);
+
+    for (int i = 0; i < n_layers; i++) {
+        struct ggml_tensor * hi = ggml_view_2d(ctx0, h, n_embd, 1, h->nb[1], (size_t) i * h->nb[1]);
+        // J is F16: on CUDA the residual is converted to F16 for the product, so massive activations
+        // (|h| > 65504 become inf -> NaN readout. J is linear, normalize h to unit RMS first.
+        if (use_jacobian) hi = ggml_rms_norm(ctx0, hi, 1e-12f);
+        struct ggml_tensor * t  = use_jacobian ? ggml_mul_mat(ctx0, Js[i], hi) : hi; // h_i @ J_i^T
+        // final norm (RMS or LayerNorm) * output_norm, then unembed.
+        struct ggml_tensor * n = use_rms ? ggml_rms_norm(ctx0, t, eps) : ggml_norm(ctx0, t, eps);
+        n = ggml_mul(ctx0, n, model.output_norm);
+        // unembed through the model's own lm_head
+        struct ggml_tensor * l = ggml_mul_mat(ctx0, model.output, n);
+        if (model.hparams.f_logit_scale != 0.0f) l = ggml_scale(ctx0, l, model.hparams.f_logit_scale);
+        ggml_set_name(l, "jlens_logits");
+        ggml_set_output(l);
+        outs[i] = l;
+        ggml_build_forward_expand(gf, l);
+    }
+
+    if (!jl->sched) {
+        jl->sched = ggml_backend_sched_new(ctx->backends.data(), nullptr,
+                                           ctx->backends.size(), 2048, false);
+        if (!jl->sched) {
+            LLAMA_LOG_ERROR("%s: failed to create jlens scheduler\n", __func__);
+            ggml_free(ctx0);
+            return false;
+        }
+    }
+
+    ggml_backend_sched_reset(jl->sched);
+    if (!ggml_backend_sched_alloc_graph(jl->sched, gf)) {
+        LLAMA_LOG_ERROR("%s: failed to alloc jlens graph\n", __func__);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    ggml_backend_tensor_set(h, residuals, 0, (size_t) n_embd * n_layers * sizeof(float));
+
+    const ggml_status st = llama_jlens_sched_compute(ctx, jl->sched, gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: jlens graph compute failed (%d)\n", __func__, (int) st);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    for (int i = 0; i < n_layers; i++) {
+        ggml_backend_tensor_get(outs[i], out_logits + (size_t) i * n_vocab, 0, n_vocab * sizeof(float));
+    }
+
+    ggml_free(ctx0);
+    return true;
+}
+
+bool llama_jlens_compute_batch(
+        struct llama_context * ctx,
+        struct llama_jlens   * jl,
+               const int32_t * layers,
+                     int32_t   n_layers,
+                     int32_t   n_pos,
+                 const float * residuals,
+                        bool   use_jacobian,
+                       float * out_probs) {
+    if (!ctx || !jl || n_layers <= 0 || n_pos <= 0 || !layers || !residuals || !out_probs) return false;
+
+    const llama_model & model = ctx->model;
+    const int64_t n_embd  = model.hparams.n_embd;
+    const int64_t n_vocab = model.hparams.n_vocab;
+
+    const bool  use_rms = model.hparams.f_norm_rms_eps != 0.0f;
+    const float eps     = use_rms ? model.hparams.f_norm_rms_eps : model.hparams.f_norm_eps;
+
+    std::vector<struct ggml_tensor *> Js(n_layers, nullptr);
+    for (int i = 0; i < n_layers; i++) {
+        const int idx = jl->index_of(layers[i]);
+        if (use_jacobian && idx < 0) {
+            LLAMA_LOG_ERROR("%s: layer %d not fitted in this lens\n", __func__, layers[i]);
+            return false;
+        }
+        if (idx >= 0) Js[i] = jl->tensors[idx];
+    }
+
+    struct ggml_init_params ip = { /*.mem_size =*/ 0, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    jl->graph_buf(jl->buf_batch, &ip.mem_buffer, &ip.mem_size);
+    ggml_context * ctx0 = ggml_init(ip);
+    if (!ctx0) return false;
+
+    // one input block per layer: [n_embd, n_pos], laid out layer-major
+    struct ggml_tensor * h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, (int64_t) n_layers * n_pos);
+    ggml_set_name(h, "jlens_h_batch");
+    ggml_set_input(h);
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+    std::vector<struct ggml_tensor *> outs(n_layers, nullptr);
+
+    for (int i = 0; i < n_layers; i++) {
+        struct ggml_tensor * hi = ggml_view_2d(ctx0, h, n_embd, n_pos, h->nb[1],
+                                               (size_t) i * n_pos * h->nb[1]);
+        // unit-RMS h keeps the F16 product finite; exact because the final norm is scale-invariant
+        if (use_jacobian) hi = ggml_rms_norm(ctx0, hi, 1e-12f);
+        struct ggml_tensor * t  = use_jacobian ? ggml_mul_mat(ctx0, Js[i], hi) : hi;
+        struct ggml_tensor * n  = use_rms ? ggml_rms_norm(ctx0, t, eps) : ggml_norm(ctx0, t, eps);
+        n = ggml_mul(ctx0, n, model.output_norm);
+        struct ggml_tensor * l = ggml_mul_mat(ctx0, model.output, n);
+        if (model.hparams.f_logit_scale != 0.0f) l = ggml_scale(ctx0, l, model.hparams.f_logit_scale);
+        // softmax on the backend: avoid exp() the whole vocabulary per layer,position
+        struct ggml_tensor * p = ggml_soft_max(ctx0, l);
+        ggml_set_name(p, "jlens_probs");
+        ggml_set_output(p);
+        outs[i] = p;
+        ggml_build_forward_expand(gf, p);
+    }
+
+    if (!jl->sched) {
+        jl->sched = ggml_backend_sched_new(ctx->backends.data(), nullptr,
+                                           ctx->backends.size(), 2048, false);
+        if (!jl->sched) {
+            LLAMA_LOG_ERROR("%s: failed to create jlens scheduler\n", __func__);
+            ggml_free(ctx0);
+            return false;
+        }
+    }
+
+    ggml_backend_sched_reset(jl->sched);
+    if (!ggml_backend_sched_alloc_graph(jl->sched, gf)) {
+        LLAMA_LOG_ERROR("%s: failed to alloc jlens batch graph\n", __func__);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    ggml_backend_tensor_set(h, residuals, 0, (size_t) n_embd * n_layers * n_pos * sizeof(float));
+
+    const ggml_status st = llama_jlens_sched_compute(ctx, jl->sched, gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: jlens batch graph compute failed (%d)\n", __func__, (int) st);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    for (int i = 0; i < n_layers; i++) {
+        ggml_backend_tensor_get(outs[i], out_probs + (size_t) i * n_pos * n_vocab, 0,
+                                (size_t) n_pos * n_vocab * sizeof(float));
+    }
+
+    ggml_free(ctx0);
+    return true;
+}
+
+bool llama_jlens_vectors(
+        struct llama_context * ctx,
+        struct llama_jlens   * jl,
+               const int32_t * layers,
+                     int32_t   n_layers,
+                 llama_token   token,
+                        bool   unit,
+                       float * out_vecs) {
+    if (!ctx || !jl || n_layers <= 0 || !layers || !out_vecs) return false;
+
+    const llama_model & model = ctx->model;
+    const int64_t n_embd  = model.hparams.n_embd;
+    const int64_t n_vocab = model.hparams.n_vocab;
+
+    if (token < 0 || token >= (llama_token) n_vocab) {
+        LLAMA_LOG_ERROR("%s: token %d out of range\n", __func__, token);
+        return false;
+    }
+    if (model.output == nullptr || model.output_norm == nullptr) {
+        LLAMA_LOG_ERROR("%s: model has no output / output_norm tensor\n", __func__);
+        return false;
+    }
+
+    std::vector<struct ggml_tensor *> Js(n_layers, nullptr);
+    for (int i = 0; i < n_layers; i++) {
+        const int idx = jl->index_of(layers[i]);
+        if (idx < 0) {
+            LLAMA_LOG_ERROR("%s: layer %d not fitted in this lens\n", __func__, layers[i]);
+            return false;
+        }
+        Js[i] = jl->tensors[idx];
+    }
+
+    struct ggml_init_params ip = { /*.mem_size =*/ 0, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    jl->graph_buf(jl->buf_vectors, &ip.mem_buffer, &ip.mem_size);
+    ggml_context * ctx0 = ggml_init(ip);
+    if (!ctx0) return false;
+
+    // u = gamma * W_U[token]: one row of the (possibly quantized) unembedding,
+    // dequantized by get_rows, scaled by the final norm's diagonal.
+    struct ggml_tensor * sel = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(sel, "jlens_tok");
+    ggml_set_input(sel);
+
+    struct ggml_tensor * u = ggml_get_rows(ctx0, model.output, sel);
+    u = ggml_mul(ctx0, u, model.output_norm);
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+    std::vector<struct ggml_tensor *> outs(n_layers, nullptr);
+
+    for (int i = 0; i < n_layers; i++) {
+        // J is stored so that ggml_mul_mat(J, h) == J_torch @ h (see the readout
+        // above); here we need J_torch^T @ u, hence the explicit transpose.
+        struct ggml_tensor * Jt = ggml_cont(ctx0, ggml_transpose(ctx0, Js[i]));
+        struct ggml_tensor * v  = ggml_mul_mat(ctx0, Jt, u);
+        ggml_set_name(v, "jlens_vec");
+        ggml_set_output(v);
+        outs[i] = v;
+        ggml_build_forward_expand(gf, v);
+    }
+
+    if (!jl->sched) {
+        jl->sched = ggml_backend_sched_new(ctx->backends.data(), nullptr,
+                                           ctx->backends.size(), 2048, false);
+        if (!jl->sched) {
+            LLAMA_LOG_ERROR("%s: failed to create jlens scheduler\n", __func__);
+            ggml_free(ctx0);
+            return false;
+        }
+    }
+
+    ggml_backend_sched_reset(jl->sched);
+    if (!ggml_backend_sched_alloc_graph(jl->sched, gf)) {
+        LLAMA_LOG_ERROR("%s: failed to alloc jlens vector graph\n", __func__);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    const int32_t tok_i32 = token;
+    ggml_backend_tensor_set(sel, &tok_i32, 0, sizeof(tok_i32));
+
+    const ggml_status st = llama_jlens_sched_compute(ctx, jl->sched, gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: jlens vector graph compute failed (%d)\n", __func__, (int) st);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    for (int i = 0; i < n_layers; i++) {
+        float * dst = out_vecs + (size_t) i * n_embd;
+        ggml_backend_tensor_get(outs[i], dst, 0, n_embd * sizeof(float));
+        if (unit) {
+            double ss = 0.0;
+            for (int64_t j = 0; j < n_embd; j++) ss += (double) dst[j] * dst[j];
+            const double nrm = std::sqrt(ss);
+            if (nrm > 0.0) {
+                for (int64_t j = 0; j < n_embd; j++) dst[j] = (float)(dst[j] / nrm);
+            }
+        }
+    }
+
+    ggml_free(ctx0);
+    return true;
+}
+
 struct llama_kv_cache_view llama_kv_cache_view_init(const struct llama_context * ctx, int32_t n_seq_max) {
     struct llama_kv_cache_view result = {
         /*.n_cells            = */ 0,

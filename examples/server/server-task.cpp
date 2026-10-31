@@ -225,6 +225,10 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat_partial() {
             };
         }
 
+        if (data.contains("jlens_probabilities")) {
+            deltas[deltas.size() - 1]["jlens_probabilities"] = data.at("jlens_probabilities");
+        }
+
         if (timings.prompt_n >= 0) {
             deltas[deltas.size() - 1].push_back({ "timings", timings.to_json() });
         }
@@ -397,6 +401,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_final() {
         {"usage",              usage_json_oaicompat()},
         {"id", oaicompat_cmpl_id}
     };
+
+    if (data.contains("jlens_probabilities")) {
+        res["jlens_probabilities"] = data.at("jlens_probabilities");
+    }
 
     // extra fields for debugging purposes
     if (verbose) {

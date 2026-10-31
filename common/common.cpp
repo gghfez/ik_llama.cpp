@@ -1940,6 +1940,29 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.control_vectors.push_back({ 1.0f, argv[i], });
         return true;
     }
+    if (arg == "--jlens") {
+        CHECK_ARG
+        params.jlens_file = argv[i];
+        return true;
+    }
+    if (arg == "--jlens-mask") {
+        CHECK_ARG
+        params.jlens_mask_files.push_back(argv[i]);
+        return true;
+    }
+    if (arg == "--no-jlens-offload") {
+        params.jlens_device = LLAMA_JLENS_DEVICE_CPU;
+        return true;
+    }
+    if (arg == "--jlens-device") {
+        CHECK_ARG
+        params.jlens_device = std::stoi(argv[i]);
+        if (params.jlens_device < LLAMA_JLENS_DEVICE_AUTO) {
+            invalid_param = true;
+            return true;
+        }
+        return true;
+    }
     if (arg == "--control-vector-scaled") {
         CHECK_ARG
         const char* fname = argv[i];
@@ -3658,6 +3681,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "note: this argument can be repeated to add multiple scaled control vectors" });
     options.push_back({ "*",           "       --control-vector-layer-range START END",
                                                                         "layer range to apply the control vector(s) to, start and end inclusive" });
+    options.push_back({ "*",           "       --jlens FNAME",         "load a pre-fit Jacobian lens for interpretability analysis and steering" });
+    options.push_back({ "*",           "       --jlens-mask FNAME",    "filter unwanted tokens from jlens output (JSON format, repeatable)" });
+    options.push_back({ "*",           "       --no-jlens-offload",    "keep Jacobian matrices on CPU (slower but saves VRAM)" });
+    options.push_back({ "*",           "       --jlens-device N",      "device for Jacobian matrices: -2=auto, -1=CPU, >=0=specific GPU" });
     options.push_back({ "*",           "-m,    --model FNAME",          "model path (default: models/$filename with filename from --hf-file\n"
                                                                         "or --model-url if set, otherwise %s)", DEFAULT_MODEL_PATH });
     options.push_back({ "*",           "-md,   --model-draft FNAME",    "draft model for speculative decoding (default: unused)" });

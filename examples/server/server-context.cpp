@@ -13,10 +13,136 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "ggml.h"
+#include "ggml-backend.h"
+
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <regex>
 #include <exception>
+
+static bool jlens_check_mask_vocab(const llama_context* ctx, const json& j, const std::string& model_path, std::string& err);
+
+// eval callback: copy the `l_out-<l>` residual rows for the lens's fitted layers into the capture buffer for the current decode batch.
+static int server_jlens_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * c = (jlens_capture *) user_data;
+    if (!c->want) return false; // not needed this decode -> don't ask for this tensor
+    const bool is_l_out = strncmp(t->name, "l_out-", 6) == 0;
+    if (ask) return is_l_out;
+    if (!is_l_out) return true;
+    char * end = nullptr;
+    const long layer = strtol(t->name + 6, &end, 10);
+    if (end == t->name + 6 || *end != '\0') return true;
+
+    const bool do_capture = layer >= 0 && layer < (long) c->is_layer.size()   && c->is_layer[layer];
+    const bool do_edit    = layer >= 0 && layer < (long) c->edit_layer.size() && c->edit_layer[layer];
+    if (!do_capture && !do_edit) return true;
+
+    if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) ||
+        t->nb[1] != (size_t) t->ne[0] * sizeof(float)) {
+        return true; // not the contiguous f32 residual we expect - leave the layer short
+    }
+    const size_t n_embd = t->ne[0];
+    const size_t n_tok  = t->ne[1];
+    c->n_embd = (int) n_embd;
+
+    size_t & rows = c->rows_seen[layer];
+    if (rows + n_tok > c->n_rows) {
+        return true; // more rows than the batch view has - drop rather than misindex
+    }
+
+    // interventions first, so the capture below reports the residual the model actually goes on to use
+    if (do_edit) {
+        c->apply_edits(t, (int) layer, rows, n_tok);
+    }
+
+    if (do_capture) {
+        auto & buf = c->data[layer];
+        const size_t need = (rows + n_tok) * n_embd;
+        if (buf.size() < need) buf.resize(need);
+        ggml_backend_tensor_get(t, buf.data() + rows * n_embd, 0, n_tok * n_embd * sizeof(float));
+    }
+    rows += n_tok;
+    return true;
+}
+
+// Apply the intervention set to the rows of one ubatch of `l_out-<layer>`.
+void jlens_capture::apply_edits(struct ggml_tensor * t, int layer, size_t base_row, size_t n_tok) {
+    const size_t d = (size_t) t->ne[0];
+
+    // 1) find the span of local columns that any edit touches
+    size_t lo = n_tok, hi = 0;
+    for (size_t c = 0; c < n_tok; c++) {
+        const size_t gr = base_row + c;
+        if (gr >= row_seq.size()) break;
+        auto it = edits.find(row_seq[gr]);
+        if (it == edits.end()) continue;
+        for (const auto & e : *it->second) {
+            if (e.layer != layer || !edit_covers(e, row_pos[gr])) continue;
+            lo = std::min(lo, c);
+            hi = std::max(hi, c + 1);
+            break;
+        }
+    }
+    if (lo >= hi) return;
+
+    const size_t n_cols = hi - lo;
+    scratch.resize(n_cols * d);
+    ggml_backend_tensor_get(t, scratch.data(), lo * d * sizeof(float), n_cols * d * sizeof(float));
+
+    // 2) apply, in request order, per covered row
+    std::vector<float> proj;
+    for (size_t c = lo; c < hi; c++) {
+        const size_t gr = base_row + c;
+        auto it = edits.find(row_seq[gr]);
+        if (it == edits.end()) continue;
+        float * x = scratch.data() + (c - lo) * d;
+
+        for (const auto & e : *it->second) {
+            if (e.layer != layer || !edit_covers(e, row_pos[gr])) continue;
+
+            switch (e.mode) {
+                case JLENS_EDIT_ADD: {
+                    // `rel` expresses the magnitude as a fraction of this row's own
+                    // residual norm, so alpha means the same thing at every depth
+                    // without needing a per-layer scale stored in the lens file.
+                    float scale = 1.0f;
+                    if (e.rel) {
+                        double ss = 0.0;
+                        for (size_t i = 0; i < d; i++) ss += (double) x[i] * x[i];
+                        scale = (float) std::sqrt(ss);
+                    }
+                    for (size_t i = 0; i < d; i++) x[i] += scale * e.a[i];
+                } break;
+
+                case JLENS_EDIT_SET:
+                    memcpy(x, e.a.data(), d * sizeof(float));
+                    break;
+
+                case JLENS_EDIT_LOWRANK: {
+                    // x += A (B x);  A: [d,k] row-major, B: [k,d] row-major
+                    const int k = e.k;
+                    proj.assign(k, 0.0f);
+                    for (int j = 0; j < k; j++) {
+                        const float * brow = e.b.data() + (size_t) j * d;
+                        double acc = 0.0;
+                        for (size_t i = 0; i < d; i++) acc += (double) brow[i] * x[i];
+                        proj[j] = (float) acc;
+                    }
+                    for (size_t i = 0; i < d; i++) {
+                        const float * arow = e.a.data() + i * (size_t) k;
+                        float acc = 0.0f;
+                        for (int j = 0; j < k; j++) acc += arow[j] * proj[j];
+                        x[i] += acc;
+                    }
+                } break;
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(t, scratch.data(), lo * d * sizeof(float), n_cols * d * sizeof(float));
+}
 
 // DFlash/DSpark (draft model family) and MTP stages work with multimodal
 static bool server_speculative_multimodal_supported(const common_params_speculative & params) {
@@ -103,6 +229,32 @@ static int32_t server_mtp_media_warmup_callback(void * user_data, const llama_ba
     return batch != nullptr
         ? common_speculative_on_target_seq_batch(data->slot->spec, data->ctx_tgt, *batch, data->slot->id, true)
         : 0;
+}
+
+// Per-batch hook for a media chunk
+struct server_media_decode_hook {
+    server_context    * sctx;
+    server_slot       * slot;
+    server_mtp_warmup * mtp;        // nullptr when the slot needs no MTP warmup
+    const char        * media;      // "image" / "audio"
+    int32_t             prompt_idx; // index in slot.prompt_tokens of the next batch's first row
+    llama_pos           pos;        // sequence position of the next batch's first row
+};
+
+static int32_t server_media_decode_callback(void * user_data, const llama_batch * batch) {
+    auto * hook = static_cast<server_media_decode_hook *>(user_data);
+    if (hook == nullptr || batch == nullptr) {
+        return 0;
+    }
+
+    const int32_t ret = hook->mtp ? server_mtp_media_warmup_callback(hook->mtp, batch) : 0;
+
+    hook->sctx->jlens_media_batch_done(*hook->slot, *batch, hook->prompt_idx, hook->media);
+    hook->prompt_idx += batch->n_tokens;
+    hook->pos        += batch->n_tokens;
+    hook->sctx->jlens_media_begin(*hook->slot, hook->pos);
+
+    return ret;
 }
 
 static bool server_response_needs_chat_parse(oaicompat_type oaicompat) {
@@ -220,6 +372,11 @@ server_context::~server_context() {
         slot.spec = nullptr;
     }
 
+    if (jlens) {
+        llama_jlens_free(jlens);
+        jlens = nullptr;
+    }
+
     if (ctx) {
         llama_free(ctx);
         ctx = nullptr;
@@ -238,6 +395,12 @@ server_context::~server_context() {
 bool server_context::load_model(const gpt_params& params_) {
     params_base = params_;
 
+    // install the Jacobian-lens residual-capture callback before the context is created
+    if (!params_base.jlens_file.empty()) {
+        params_base.cb_eval           = server_jlens_cb_eval;
+        params_base.cb_eval_user_data = &jlens_cap;
+    }
+
     llama_init_result llama_init = llama_init_from_gpt_params(params_base);
 
     model = llama_init.model;
@@ -254,6 +417,71 @@ bool server_context::load_model(const gpt_params& params_) {
     } catch (const std::exception & e) {
         SRV_ERR("failed to init decision model: %s\n", e.what());
         return false;
+    }
+
+    // load the Jacobian lens (after the model, so d_model can be validated)
+    if (!params_base.jlens_file.empty()) {
+        jlens = llama_jlens_load(params_base.jlens_file.c_str(), model, params_base.jlens_device);
+        if (jlens == nullptr) {
+            LOG_ERROR("failed to load jlens", { {"jlens", params_base.jlens_file} });
+            return false;
+        }
+        const int32_t n = llama_jlens_n_layers(jlens);
+        const int32_t * src = llama_jlens_layers(jlens);
+        jlens_source_layers.assign(src, src + n);
+        int max_layer = 0;
+        for (int i = 0; i < n; i++) max_layer = std::max(max_layer, src[i]);
+        jlens_cap.is_layer.assign(max_layer + 1, 0);
+        for (int i = 0; i < n; i++) jlens_cap.is_layer[src[i]] = 1;
+
+        // --jlens-mask files, merged layer by layer
+        jlens_mask.assign(max_layer + 1, {});
+        for (const std::string& path : params_base.jlens_mask_files) {
+            std::ifstream f(path);
+            std::string err;
+            json j;
+            jlens_token_mask m;
+            if (!f.is_open()) {
+                err = "cannot open file";
+            } else if ((j = json::parse(f, nullptr, false)).is_discarded()) {
+                err = "invalid json";
+            } else if (jlens_check_mask_vocab(ctx, j, params_base.model, err)) {
+                jlens_parse_mask(j, max_layer + 1, llama_n_vocab(model), m, err);
+            }
+            if (!err.empty()) {
+                LOG_ERROR("failed to load jlens mask", { {"jlens_mask", path}, {"error", err} });
+                return false;
+            }
+            size_t n_ids = 0;
+            int    n_masked_layers = 0;
+            for (size_t l = 0; l < m.size(); l++) {
+                n_ids += m[l].size();
+                n_masked_layers += !m[l].empty();
+                auto& dst = jlens_mask[l];
+                dst.insert(dst.end(), m[l].begin(), m[l].end());
+                std::sort(dst.begin(), dst.end());
+                dst.erase(std::unique(dst.begin(), dst.end()), dst.end());
+            }
+            LOG_INFO("loaded jlens mask", { {"jlens_mask", path}, {"n_layers", n_masked_layers}, {"n_ids", n_ids} });
+        }
+
+        // special-token categories for "jlens_mask_special".
+        static const std::regex re_reserved(R"(<unused\d+>|\[PAD\d+\])"); // Some vocabs mark their reserved slots as normal tokens (Gemma's <unusedN>)
+        const int n_vocab = llama_n_vocab(model);
+        for (llama_token t = 0; t < n_vocab; t++) {
+            const auto attr = llama_token_get_attr(model, t);
+            if (attr & LLAMA_TOKEN_ATTR_CONTROL)      jlens_special_ids[0].push_back(t);
+            if ((attr & LLAMA_TOKEN_ATTR_UNUSED) ||
+                std::regex_match(llama_token_get_text(model, t), re_reserved)) jlens_special_ids[1].push_back(t);
+            if (attr & LLAMA_TOKEN_ATTR_USER_DEFINED) jlens_special_ids[2].push_back(t);
+            if (attr & LLAMA_TOKEN_ATTR_BYTE)         jlens_special_ids[3].push_back(t);
+            if (attr & LLAMA_TOKEN_ATTR_UNKNOWN)      jlens_special_ids[4].push_back(t);
+        }
+        json counts = json::object();
+        for (size_t i = 0; i < std::size(JLENS_SPECIAL_NAMES); i++) counts[JLENS_SPECIAL_NAMES[i]] = jlens_special_ids[i].size();
+        LOG_INFO("jlens special-token categories", { {"n_ids", counts} });
+    } else if (!params_base.jlens_mask_files.empty()) {
+        LOG_WARNING("--jlens-mask has no effect without --jlens", {});
     }
 
     n_ctx = llama_n_ctx(ctx);
@@ -582,6 +810,7 @@ void server_slot::reset() {
     rewind_status = false;
 
     generated_token_probs.clear();
+    jlens_prompt_probs.clear();
     checkpoint_pos = -1;
     image_just_processed = false;
     do_checkpoint = false;
@@ -1130,6 +1359,10 @@ server_slot* server_context::get_available_slot(const server_task& task) {
         // don't update the cache if the slot's context is above cache_ram_n_min
         update_cache = update_cache && cache_token_size >= cache_ram_n_min;
 
+        // never persist K/V produced under a Jacobian-lens intervention set: another
+        // request could load it as a prefix and inherit the edits
+        update_cache = update_cache && ret->jlens_cache_hash == 0;
+
         LLAMA_LOG_INFO("======== Prompt cache: cache size: %d, n_keep: %d, n_discarded_prompt: %d, cache_ram_n_min: %d, f_keep: %.2f, cache_ram_similarity: %.2f\n",
             (int)tokens.size(), ret->n_kept_prompt, ret->n_discarded_prompt, cache_ram_n_min, f_keep, cache_ram_similarity);
         if (update_cache) {
@@ -1144,14 +1377,17 @@ server_slot* server_context::get_available_slot(const server_task& task) {
         // has prompts saved earlier to load
         if (prompt_cache && !prompt_cache->states.empty()) {
             const int64_t t_start = ggml_time_us();
-            copy_data_to_cached_prompt(tokens, *ret);
 
-            ret->prompt_load(*prompt_cache, task.tokens, cache_ram_similarity);
+            if (ret->jlens_cache_hash == 0) {
+                copy_data_to_cached_prompt(tokens, *ret);
+
+                ret->prompt_load(*prompt_cache, task.tokens, cache_ram_similarity);
+
+                ret->cache_tokens = ret->server_cached_prompt.tokens.clone(); // recover cache tokens
+                ret->n_discarded_prompt = ret->server_cached_prompt.n_discarded_prompt;
+                ret->n_kept_prompt = ret->server_cached_prompt.n_kept_prompt;
+            }
             prompt_cache->update();
-
-            ret->cache_tokens = ret->server_cached_prompt.tokens.clone(); // recover cache tokens
-            ret->n_discarded_prompt = ret->server_cached_prompt.n_discarded_prompt;
-            ret->n_kept_prompt = ret->server_cached_prompt.n_kept_prompt;
 
             LLAMA_LOG_INFO("prompt cache load took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
         }
@@ -1244,6 +1480,80 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     slot.sparams.min_keep = json_value(data, "min_keep", default_sparams.min_keep);
 
     slot.params.post_sampling_probs = json_value(data, "post_sampling_probs", defaults.post_sampling_probs);
+
+    // Jacobian-lens readout (only honoured when the server was started with --jlens)
+    slot.params.jlens_n_probs      = jlens ? json_value(data, "jlens_n_probs", 0) : 0;
+    slot.params.jlens_use_jacobian = json_value(data, "jlens_use_jacobian", true);
+    slot.params.jlens_layers.clear();
+    if (data.contains("jlens_layers") && !data.at("jlens_layers").is_null()) {
+        std::string layers_err;
+        if (!jlens_parse_layers(data.at("jlens_layers"), slot.params.jlens_layers, layers_err)) {
+            send_error(task, "jlens_layers: " + layers_err, ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+    }
+
+    // Jacobian-lens readout mask: true = the server's --jlens-mask, false = none,
+    // or an object in the same format as the mask file to use instead.
+    slot.params.jlens_mask        = true;
+    slot.params.jlens_mask_custom = false;
+    slot.params.jlens_mask_ids.clear();
+    if (data.contains("jlens_mask") && !data.at("jlens_mask").is_null()) {
+        const json& m = data.at("jlens_mask");
+        if (m.is_boolean()) {
+            slot.params.jlens_mask = m.get<bool>();
+        } else if (jlens) {
+            std::string mask_err;
+            if (!jlens_check_mask_vocab(ctx, m, params_base.model, mask_err) ||
+                !jlens_parse_mask(m, (int32_t) jlens_cap.is_layer.size(), llama_n_vocab(model),
+                                  slot.params.jlens_mask_ids, mask_err)) {
+                send_error(task, "jlens_mask: " + mask_err, ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            slot.params.jlens_mask_custom = true;
+        }
+    }
+    slot.params.jlens_mask_renorm = json_value(data, "jlens_mask_renorm", false);
+    {
+        std::string special_err;
+        if (!jlens_parse_special(data.contains("jlens_mask_special") ? data.at("jlens_mask_special") : json(),
+                                 slot.params.jlens_mask_special, special_err)) {
+            send_error(task, "jlens_mask_special: " + special_err, ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+    }
+
+    slot.params.jlens_prompt = jlens ? json_value(data, "jlens_prompt", false) : false;
+    slot.params.jlens_prompt_pos_start = json_value(data, "jlens_prompt_pos_start", 0);
+    slot.params.jlens_prompt_pos_end   = json_value(data, "jlens_prompt_pos_end", -1);
+    if (slot.params.jlens_prompt) {
+        if (slot.params.jlens_n_probs <= 0) {
+            send_error(task, "jlens_prompt requires jlens_n_probs > 0", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+        if (slot.params.jlens_prompt_pos_start < 0 ||
+            (slot.params.jlens_prompt_pos_end >= 0 &&
+             slot.params.jlens_prompt_pos_end <= slot.params.jlens_prompt_pos_start)) {
+            send_error(task, "jlens_prompt: bad position range", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+        slot.params.cache_prompt = false;
+    }
+
+    // Jacobian-lens interventions. The cache reconciliation runs unconditionally:
+    // a request *without* interventions still has to drop a prefix that was built with them.
+    {
+        std::string jlens_err;
+        const bool jlens_ok = parse_jlens_edits(data, slot, jlens_err);
+        if (!jlens_ok) {
+            slot.params.jlens_edits.clear();
+        }
+        jlens_sync_slot_cache(slot);
+        if (!jlens_ok) {
+            send_error(task, jlens_err, ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+    }
 
     // speculative decoding parameters
     try {
@@ -2391,6 +2701,603 @@ void server_context::populate_token_probs(const server_slot& slot, completion_to
     }
 }
 
+// A mask is a list of token ids, so it is only meaningful for the vocabulary it was
+// built on. When the mask carries {"tokens": {"<id>": "<tok_str>"}} (written by
+// jlens_attractor_scan.py), every id must still spell the same token here; otherwise
+// fall back to comparing meta.model with the loaded model's file name (warn only).
+static bool jlens_check_mask_vocab(const llama_context* ctx, const json& j, const std::string& model_path, std::string& err) {
+    if (j.contains("tokens") && j.at("tokens").is_object()) {
+        int n_bad = 0, n = 0;
+        std::string examples;
+        for (const auto& [key, val] : j.at("tokens").items()) {
+            if (!val.is_string()) continue;
+            n++;
+            const llama_token id = (llama_token) std::strtol(key.c_str(), nullptr, 10);
+            const std::string have = tokens_to_output_formatted_string(ctx, id);
+            if (have != val.get<std::string>()) {
+                if (n_bad++ < 3) examples += "\n  id " + key + ": mask has " + json(val).dump() + ", model has " + json(have).dump();
+            }
+        }
+        if (n_bad > 0) {
+            err = std::to_string(n_bad) + "/" + std::to_string(n) +
+                  " token ids spell different tokens in this model's vocab - the mask was built for another tokenizer" + examples;
+            return false;
+        }
+        return true;
+    }
+    if (j.contains("meta") && j.at("meta").is_object() && j.at("meta").contains("model") && j.at("meta").at("model").is_string()) {
+        auto base = [](const std::string& s) { const size_t p = s.find_last_of("/\\"); return p == std::string::npos ? s : s.substr(p + 1); };
+        const std::string mask_model = j.at("meta").at("model").get<std::string>();
+        if (base(mask_model) != base(model_path)) {
+            LOG_WARNING("jlens mask was built on a different model and carries no \"tokens\" map to verify its ids "
+                        "(re-run jlens_attractor_scan.py --summarize-only to add one)",
+                        { {"mask_model", base(mask_model)}, {"model", base(model_path)} });
+        }
+    }
+    return true;
+}
+
+std::vector<const std::vector<llama_token>*> server_context::jlens_masks_for(const server_slot& slot, int32_t layer) const {
+    std::vector<const std::vector<llama_token>*> out;
+    if (slot.params.jlens_mask) {
+        const jlens_token_mask& m = slot.params.jlens_mask_custom ? slot.params.jlens_mask_ids : jlens_mask;
+        if (layer >= 0 && layer < (int32_t) m.size() && !m[layer].empty()) out.push_back(&m[layer]);
+    }
+    for (size_t i = 0; i < std::size(JLENS_SPECIAL_NAMES); i++) {
+        if ((slot.params.jlens_mask_special >> i) & 1) out.push_back(&jlens_special_ids[i]);
+    }
+    return out;
+}
+
+void server_context::jlens_top_k(float* pv, int n_vocab, size_t k, const std::vector<const std::vector<llama_token>*>& masks,
+                                 bool renorm, std::vector<int>& order, completion_token_output::layer_probs& lp) {
+    // knock the masked ids below every real probability so they sort last (an id in more than one list is only counted once)
+    size_t n_masked = 0;
+    for (const auto* mask : masks) {
+        for (llama_token t : *mask) {
+            if (t < 0 || t >= n_vocab || pv[t] < 0.0f) continue;
+            pv[t] = -1.0f;
+            n_masked++;
+        }
+    }
+    k = std::min(k, (size_t) n_vocab - n_masked);
+
+    // renorm divides by the probability left on the unmasked vocab. Sum it directly:
+    // 1 - (masked mass) cancels catastrophically when an attractor holds ~all of it,
+    // leaving the float error of the softmax as the denominator.
+    float scale = 1.0f;
+    if (renorm && n_masked > 0) {
+        double kept = 0.0;
+        for (int v = 0; v < n_vocab; v++) if (pv[v] > 0.0f) kept += pv[v];
+        if (kept > 0.0) scale = (float) (1.0 / kept);
+    }
+
+    for (int v = 0; v < n_vocab; v++) order[v] = v;
+    std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                      [&](int a, int b) { return pv[a] > pv[b]; });
+    lp.probs.reserve(k);
+    for (size_t j = 0; j < k; j++) {
+        const int t = order[j];
+        lp.probs.push_back({ t, common_token_to_piece(ctx, t, params_base.special), pv[t] * scale });
+    }
+}
+
+// Jacobian-lens readout for the token sampled at batch row `idx`: for each requested source layer,
+// transport the captured residual through the lens and unembed, then report the top-k tokens with softmax probabilities.
+void server_context::populate_jlens_probs(const server_slot& slot, completion_token_output& result, int idx) {
+    if (jlens == nullptr || slot.params.jlens_n_probs <= 0) return;
+
+    // resolve the requested layers (validated subset, or all fitted layers)
+    std::vector<int32_t> layers;
+    if (!slot.params.jlens_layers.empty()) {
+        for (int32_t l : slot.params.jlens_layers) {
+            if (l >= 0 && l < (int) jlens_cap.is_layer.size() && jlens_cap.is_layer[l]) {
+                layers.push_back(l);
+            }
+        }
+    } else {
+        layers = jlens_source_layers;
+    }
+    if (layers.empty()) {
+        LOG_WARNING("jlens: no valid layers to read out (check jlens_layers)", {});
+        return;
+    }
+
+    const int n_embd  = llama_model_n_embd(model);
+    const int n_vocab = llama_n_vocab(model);
+
+    // gather captured residuals at this token's row; skip any layer whose residual wasn't captured.
+    std::vector<int32_t> got_layers;
+    std::vector<float>    residuals;
+    got_layers.reserve(layers.size());
+    residuals.reserve(layers.size() * (size_t) n_embd);
+    for (int32_t layer : layers) {
+        if (idx < 0) continue;
+        const float * h = jlens_cap.row(layer, (size_t) idx);
+        if (h == nullptr) continue;
+        got_layers.push_back(layer);
+        residuals.insert(residuals.end(), h, h + n_embd);
+    }
+    if (got_layers.empty()) {
+        LOG_WARNING("jlens: no residuals captured for the requested layers", {
+            {"idx", idx}, {"captured_layers", (int) jlens_cap.data.size()},
+        });
+        return;
+    }
+
+    const int n = (int) got_layers.size();
+    layers.swap(got_layers);
+
+    std::vector<float> logits((size_t) n * n_vocab);
+    if (!llama_jlens_compute(ctx, jlens, layers.data(), n, residuals.data(),
+                             slot.params.jlens_use_jacobian, logits.data())) {
+        LOG_WARNING("jlens: llama_jlens_compute failed", {{"n_layers", n}});
+        return;
+    }
+
+    const size_t k = std::min((size_t) slot.params.jlens_n_probs, (size_t) n_vocab);
+    result.jlens_layers.reserve(n);
+    std::vector<int> order(n_vocab);
+    for (int i = 0; i < n; i++) {
+        // softmax in place (probabilities), stable around the max
+        float * lg = logits.data() + (size_t) i * n_vocab;
+        const float mx = *std::max_element(lg, lg + n_vocab);
+        double sum = 0.0;
+        for (int v = 0; v < n_vocab; v++) sum += std::exp((double)(lg[v] - mx));
+        for (int v = 0; v < n_vocab; v++) lg[v] = (float)(std::exp((double)(lg[v] - mx)) / sum);
+
+        completion_token_output::layer_probs lp;
+        lp.layer = layers[i];
+        jlens_top_k(lg, n_vocab, k, jlens_masks_for(slot, layers[i]), slot.params.jlens_mask_renorm, order, lp);
+        result.jlens_layers.push_back(std::move(lp));
+    }
+}
+
+// Read out the lens at prompt positions from the batch that was just decoded.
+//
+// Probability block is n_layers * chunk * n_vocab floats:
+// chunk is sized from the layer count to bound both the host buffer and the graph's compute buffer.
+void server_context::collect_jlens_prompt_probs(const llama_batch& batch_view) {
+    if (jlens == nullptr) return;
+
+    for (auto & slot : slots) {
+        if (!slot.is_processing() || !slot.params.jlens_prompt) continue;
+
+        // which rows of this batch are prompt positions this slot wants?
+        const int32_t p_end = slot.params.jlens_prompt_pos_end < 0
+            ? slot.n_prompt_tokens : slot.params.jlens_prompt_pos_end;
+        std::vector<int32_t> rows, poss;
+        for (int32_t j = 0; j < batch_view.n_tokens; j++) {
+            if (batch_view.n_seq_id[j] <= 0 || batch_view.seq_id[j][0] != slot.id) continue;
+            const int32_t pos = batch_view.pos[j];
+            if (pos < slot.params.jlens_prompt_pos_start || pos >= p_end) continue;
+            if (pos >= slot.n_prompt_tokens) continue; // generated, not prompt
+            rows.push_back(j);
+            poss.push_back(pos);
+        }
+        jlens_prompt_readout(slot, rows, poss, nullptr);
+    }
+}
+
+void server_context::jlens_prompt_readout(server_slot& slot, const std::vector<int32_t>& rows,
+                                          const std::vector<int32_t>& poss, const char * media) {
+    if (jlens == nullptr || rows.empty()) return;
+
+    const int n_embd  = llama_model_n_embd(model);
+    const int n_vocab = llama_n_vocab(model);
+
+    // resolve the layer set (same rules as the per-token readout)
+    std::vector<int32_t> layers;
+    if (!slot.params.jlens_layers.empty()) {
+        for (int32_t l : slot.params.jlens_layers) {
+            if (l >= 0 && l < (int) jlens_cap.is_layer.size() && jlens_cap.is_layer[l]) {
+                layers.push_back(l);
+            }
+        }
+    } else {
+        layers = jlens_source_layers;
+    }
+    if (layers.empty()) return;
+
+    // drop any layer that wasn't fully captured for this batch (see jlens_capture::row)
+    std::vector<int32_t> got;
+    for (int32_t l : layers) {
+        if (jlens_cap.row(l, 0) != nullptr) got.push_back(l);
+    }
+    if (got.empty()) {
+        LOG_WARNING("jlens: no residuals captured for the prompt probe", {{"id_slot", slot.id}});
+        return;
+    }
+
+    const int n_l = (int) got.size();
+    // ~128 MiB of probabilities per chunk
+    int chunk = (int) ((128ull << 20) / ((size_t) n_l * n_vocab * sizeof(float)));
+    chunk = std::max(1, std::min(chunk, 32));
+
+    const size_t k = std::min((size_t) slot.params.jlens_n_probs, (size_t) n_vocab);
+    std::vector<float> residuals, probs;
+    std::vector<int>   order(n_vocab);
+
+    for (size_t c0 = 0; c0 < rows.size(); c0 += chunk) {
+        const int n_p = (int) std::min((size_t) chunk, rows.size() - c0);
+
+        // gather [layer][pos][n_embd]
+        residuals.resize((size_t) n_l * n_p * n_embd);
+        for (int li = 0; li < n_l; li++) {
+            for (int pi = 0; pi < n_p; pi++) {
+                const float * h = jlens_cap.row(got[li], (size_t) rows[c0 + pi]);
+                if (h == nullptr) { residuals.clear(); break; }
+                memcpy(residuals.data() + ((size_t) li * n_p + pi) * n_embd,
+                       h, n_embd * sizeof(float));
+            }
+            if (residuals.empty()) break;
+        }
+        if (residuals.empty()) continue;
+
+        probs.resize((size_t) n_l * n_p * n_vocab);
+        if (!llama_jlens_compute_batch(ctx, jlens, got.data(), n_l, n_p, residuals.data(),
+                                       slot.params.jlens_use_jacobian, probs.data())) {
+            LOG_WARNING("jlens: prompt probe compute failed", {{"n_layers", n_l}, {"n_pos", n_p}});
+            break;
+        }
+
+        for (int pi = 0; pi < n_p; pi++) {
+            jlens_prompt_output out;
+            out.pos = poss[c0 + pi];
+            out.tok = slot.prompt_tokens[out.pos];
+            out.media = media;
+            out.layers.reserve(n_l);
+            for (int li = 0; li < n_l; li++) {
+                float * pv = probs.data() + ((size_t) li * n_p + pi) * n_vocab;
+                completion_token_output::layer_probs lp;
+                lp.layer = got[li];
+                jlens_top_k(pv, n_vocab, k, jlens_masks_for(slot, got[li]), slot.params.jlens_mask_renorm, order, lp);
+                out.layers.push_back(std::move(lp));
+            }
+            slot.jlens_prompt_probs.push_back(std::move(out));
+        }
+    }
+}
+
+void server_context::jlens_media_begin(server_slot& slot, llama_pos pos) {
+    // the helper splits the chunk into batches of at most n_batch rows; row count is unknown until a batch is done
+    const size_t n_max = (size_t) llama_n_batch(ctx);
+    jlens_cap.begin_decode(false, n_max);
+    if (jlens == nullptr) return;
+
+    bool want = slot.params.jlens_prompt && slot.params.jlens_n_probs > 0;
+    if (!slot.params.jlens_edits.empty()) {
+        want = true;
+        jlens_cap.add_edits(slot.id, slot.params.jlens_edits);
+        jlens_cap.row_seq.assign(n_max, slot.id);
+        jlens_cap.row_pos.resize(n_max);
+        for (size_t j = 0; j < n_max; j++) {
+            jlens_cap.row_pos[j] = pos + (llama_pos) j;
+        }
+    }
+    jlens_cap.want = want;
+}
+
+void server_context::jlens_media_batch_done(server_slot& slot, const llama_batch& batch,
+                                            int32_t prompt_idx, const char * media) {
+    if (jlens == nullptr || !slot.params.jlens_prompt || !jlens_cap.want) return;
+
+    jlens_cap.n_rows = (size_t) batch.n_tokens;
+
+    const int32_t p_end = slot.params.jlens_prompt_pos_end < 0
+        ? slot.n_prompt_tokens : slot.params.jlens_prompt_pos_end;
+    std::vector<int32_t> rows, poss;
+    for (int32_t j = 0; j < batch.n_tokens; j++) {
+        const int32_t pos = prompt_idx + j;
+        if (pos < slot.params.jlens_prompt_pos_start || pos >= p_end) continue;
+        if (pos >= slot.n_prompt_tokens) continue;
+        rows.push_back(j);
+        poss.push_back(pos);
+    }
+    jlens_prompt_readout(slot, rows, poss, media);
+}
+
+// FNV-1a over the resolved edit set. Two requests with the same hash produce the
+// same residual-stream edits, may share a cached prefix.
+static uint64_t jlens_edits_hash(const std::vector<jlens_edit> & edits) {
+    if (edits.empty()) return 0;
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const void * p, size_t n) {
+        const uint8_t * b = (const uint8_t *) p;
+        for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    };
+    for (const auto & e : edits) {
+        mix(&e.layer, sizeof(e.layer));
+        mix(&e.pos_start, sizeof(e.pos_start));
+        mix(&e.pos_end, sizeof(e.pos_end));
+        mix(&e.mode, sizeof(e.mode));
+        mix(&e.rel, sizeof(e.rel));
+        mix(&e.k, sizeof(e.k));
+        mix(e.a.data(), e.a.size() * sizeof(float));
+        mix(e.b.data(), e.b.size() * sizeof(float));
+    }
+    return h ? h : 1; // 0 is reserved for "no interventions"
+}
+
+// Parse "jlens_interventions". Semantic ops (steer / ablate / swap / replace) are resolved
+// here, once per request, into the raw add/lowrank primitives the eval callback applies.
+bool server_context::parse_jlens_edits(const json& data, server_slot& slot, std::string& err) {
+    slot.params.jlens_edits.clear();
+
+    if (!data.contains("jlens_interventions") || data.at("jlens_interventions").is_null()) {
+        return true;
+    }
+    const json & arr = data.at("jlens_interventions");
+    if (!arr.is_array()) {
+        err = "jlens_interventions must be an array";
+        return false;
+    }
+    if (arr.empty()) {
+        return true;
+    }
+    if (jlens == nullptr) {
+        err = "jlens_interventions requires the server to be started with --jlens";
+        return false;
+    }
+
+    const int n_embd  = llama_model_n_embd(model);
+    const int n_vocab = llama_n_vocab(model);
+    const int n_layer = (int) jlens_cap.is_layer.size();
+
+    // resolve a token: explicit id, or a string that must be exactly one token
+    auto resolve_token = [&](const json & spec, const char * field, llama_token & out) -> bool {
+        const std::string id_field = std::string(field) + "_id";
+        if (spec.contains(id_field) && spec.at(id_field).is_number_integer()) {
+            out = spec.at(id_field).get<llama_token>();
+            if (out < 0 || out >= n_vocab) {
+                err = "jlens_interventions: " + id_field + " out of range";
+                return false;
+            }
+            return true;
+        }
+        if (!spec.contains(field) || !spec.at(field).is_string()) {
+            err = std::string("jlens_interventions: missing \"") + field + "\" (or \"" + id_field + "\")";
+            return false;
+        }
+        const std::string piece = spec.at(field).get<std::string>();
+        const auto ids = common_tokenize(model, piece, /* add_special = */ false, /* parse_special = */ false);
+        if (ids.size() != 1) {
+            err = "jlens_interventions: \"" + piece + "\" is " + std::to_string(ids.size()) +
+                  " tokens, expected exactly 1 (try a leading space, or use " + id_field + ")";
+            return false;
+        }
+        out = ids[0];
+        return true;
+    };
+
+    // "layers": [a, b] inclusive range, or any spec jlens_parse_layers accepts
+    // ("18,24,30-44", [18, 24, "30-44"], ...); absent = every fitted layer
+    auto resolve_layers = [&](const json & spec, std::vector<int32_t> & out, bool must_be_fitted) -> bool {
+        out.clear();
+        if (spec.contains("layer") && spec.at("layer").is_number_integer()) {
+            out.push_back(spec.at("layer").get<int32_t>());
+        } else if (spec.contains("layers") && !spec.at("layers").is_null()) {
+            const auto & ls = spec.at("layers");
+            if (ls.is_array() && ls.size() == 2 && ls[0].is_number_integer() && ls[1].is_number_integer() &&
+                ls[0].get<int32_t>() <= ls[1].get<int32_t>() && spec.value("layer_range", true)) {
+                for (int32_t l = ls[0].get<int32_t>(); l <= ls[1].get<int32_t>(); l++) out.push_back(l);
+            } else {
+                std::string layers_err;
+                if (!jlens_parse_layers(ls, out, layers_err)) {
+                    err = "jlens_interventions: " + layers_err;
+                    return false;
+                }
+            }
+        } else if (must_be_fitted) {
+            out = jlens_source_layers;
+        } else {
+            err = "jlens_interventions: raw edits require \"layer\"";
+            return false;
+        }
+        if (out.empty()) {
+            err = "jlens_interventions: empty layer set";
+            return false;
+        }
+        for (int32_t l : out) {
+            if (l < 0 || l >= n_layer) {
+                err = "jlens_interventions: layer " + std::to_string(l) + " out of range";
+                return false;
+            }
+            if (must_be_fitted && !llama_jlens_has_layer(jlens, l)) {
+                err = "jlens_interventions: layer " + std::to_string(l) + " is not fitted in this lens";
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto decode_floats = [&](const json & spec, size_t want, std::vector<float> & out) -> bool {
+        if (!spec.contains("data") || !spec.at("data").is_string()) {
+            err = "jlens_interventions: raw edits need base64 \"data\"";
+            return false;
+        }
+        const auto raw = base64_decode(spec.at("data").get<std::string>());
+        if (raw.size() != want * sizeof(float)) {
+            err = "jlens_interventions: \"data\" is " + std::to_string(raw.size() / sizeof(float)) +
+                  " floats, expected " + std::to_string(want);
+            return false;
+        }
+        out.resize(want);
+        memcpy(out.data(), raw.data(), raw.size());
+        return true;
+    };
+
+    for (const auto & spec : arr) {
+        if (!spec.is_object()) {
+            err = "jlens_interventions: each entry must be an object";
+            return false;
+        }
+        const std::string mode = json_value(spec, "mode", std::string("steer"));
+        const int32_t pos_start = json_value(spec, "pos_start", 0);
+        const int32_t pos_end   = json_value(spec, "pos_end", -1);
+        if (pos_start < 0 || (pos_end >= 0 && pos_end <= pos_start)) {
+            err = "jlens_interventions: bad position range";
+            return false;
+        }
+
+        std::vector<int32_t> layers;
+        const bool two_tok  = (mode == "swap" || mode == "replace"); // "from" -> "to"
+        const bool semantic = (mode == "steer" || mode == "ablate" || two_tok);
+        if (!resolve_layers(spec, layers, semantic)) return false;
+
+        auto emit = [&](int32_t layer, jlens_edit_mode m) -> jlens_edit & {
+            slot.params.jlens_edits.emplace_back();
+            jlens_edit & e = slot.params.jlens_edits.back();
+            e.layer     = layer;
+            e.pos_start = pos_start;
+            e.pos_end   = pos_end;
+            e.mode      = m;
+            return e;
+        };
+
+        if (mode == "add" || mode == "set") {
+            std::vector<float> a;
+            if (!decode_floats(spec, (size_t) n_embd, a)) return false;
+            for (int32_t l : layers) {
+                jlens_edit & e = emit(l, mode == "add" ? JLENS_EDIT_ADD : JLENS_EDIT_SET);
+                e.a   = a;
+                e.rel = mode == "add" && json_value(spec, "relative", false);
+            }
+        } else if (mode == "lowrank") {
+            const int32_t k = json_value(spec, "k", 0);
+            if (k <= 0 || k > 256) {
+                err = "jlens_interventions: lowrank k must be in [1, 256]";
+                return false;
+            }
+            std::vector<float> ab;
+            if (!decode_floats(spec, (size_t) n_embd * k * 2, ab)) return false;
+            for (int32_t l : layers) {
+                jlens_edit & e = emit(l, JLENS_EDIT_LOWRANK);
+                e.k = k;
+                e.a.assign(ab.begin(), ab.begin() + (size_t) n_embd * k);
+                e.b.assign(ab.begin() + (size_t) n_embd * k, ab.end());
+            }
+        } else if (semantic) {
+            // J-lens vectors for the whole layer set, in one graph
+            llama_token tok_a = -1, tok_b = -1;
+            if (!resolve_token(spec, two_tok ? "from" : "token", tok_a)) return false;
+
+            std::vector<float> va((size_t) layers.size() * n_embd);
+            if (!llama_jlens_vectors(ctx, jlens, layers.data(), (int32_t) layers.size(),
+                                     tok_a, /* unit = */ true, va.data())) {
+                err = "jlens_interventions: failed to build lens vectors";
+                return false;
+            }
+            std::vector<float> vb;
+            if (two_tok) {
+                if (!resolve_token(spec, "to", tok_b)) return false;
+                vb.resize((size_t) layers.size() * n_embd);
+                if (!llama_jlens_vectors(ctx, jlens, layers.data(), (int32_t) layers.size(),
+                                         tok_b, /* unit = */ true, vb.data())) {
+                    err = "jlens_interventions: failed to build lens vectors";
+                    return false;
+                }
+            }
+
+            const float alpha = json_value(spec, "alpha", 1.0f);
+
+            for (size_t i = 0; i < layers.size(); i++) {
+                const float * v1 = va.data() + i * n_embd;
+
+                if (mode == "steer") {
+                    // h += alpha * ||h|| * v_hat
+                    jlens_edit & e = emit(layers[i], JLENS_EDIT_ADD);
+                    e.rel = true;
+                    e.a.resize(n_embd);
+                    for (int j = 0; j < n_embd; j++) e.a[j] = alpha * v1[j];
+
+                } else if (mode == "ablate") {
+                    // h -= (v_hat . h) v_hat   -- rank-1
+                    jlens_edit & e = emit(layers[i], JLENS_EDIT_LOWRANK);
+                    e.k = 1;
+                    e.a.resize(n_embd);
+                    e.b.resize(n_embd);
+                    for (int j = 0; j < n_embd; j++) { e.a[j] = -v1[j]; e.b[j] = v1[j]; }
+
+                } else { // swap
+                    // The jacobian lens paper's concept patch: read the lens coordinates of the two
+                    // directions, c = V^+ h, exchange them, h += V(sigma(c) - c). With
+                    // V = [v1 v2] and unit columns, V^T V = [[1,g],[g,1]], so
+                    //   B = (V^T V)^-1 V^T   and   A = V ([[0,1],[1,0]] - I).
+                    // Whatever is orthogonal to both directions is untouched.
+                    const float * v2 = vb.data() + i * n_embd;
+                    double gd = 0.0;
+                    for (int j = 0; j < n_embd; j++) gd += (double) v1[j] * v2[j];
+                    const double det = 1.0 - gd * gd;
+                    if (std::abs(det) < 1e-6) {
+                        err = "jlens_interventions: " + mode + " directions are collinear at layer " +
+                              std::to_string(layers[i]);
+                        return false;
+                    }
+                    const float g = (float) gd, inv = (float) (1.0 / det);
+
+                    if (mode == "replace") {
+                        //replace
+                        // One-way, idemoptent version of swap: move the "from" coordinate onto "to" and zero it,
+                        // (c1, c2) -> (0, c2 + c1), i.e. h += (v2 - v1) c1 with c1 the first row of B.
+                        jlens_edit & e = emit(layers[i], JLENS_EDIT_LOWRANK);
+                        e.k = 1;
+                        e.a.resize(n_embd);
+                        e.b.resize(n_embd);
+                        for (int j = 0; j < n_embd; j++) {
+                            e.a[j] = v2[j] - v1[j];
+                            e.b[j] = inv * (v1[j] - g * v2[j]);
+                        }
+                        continue;
+                    }
+
+                    jlens_edit & e = emit(layers[i], JLENS_EDIT_LOWRANK);
+                    e.k = 2;
+                    e.a.resize((size_t) n_embd * 2);
+                    e.b.resize((size_t) n_embd * 2);
+                    for (int j = 0; j < n_embd; j++) {
+                        // A = V M, columns: (v2 - v1) and (v1 - v2); row-major [d,2]
+                        e.a[(size_t) j * 2 + 0] = v2[j] - v1[j];
+                        e.a[(size_t) j * 2 + 1] = v1[j] - v2[j];
+                        // B rows: (v1 - g v2)/det and (v2 - g v1)/det
+                        e.b[(size_t) 0 * n_embd + j] = inv * (v1[j] - g * v2[j]);
+                        e.b[(size_t) 1 * n_embd + j] = inv * (v2[j] - g * v1[j]);
+                    }
+                }
+            }
+        } else {
+            err = "jlens_interventions: unknown mode \"" + mode + "\"";
+            return false;
+        }
+    }
+
+    // Interventions change the K/V of every layer above them. Refuse combinations where that would corrupt it.
+    if (!slot.params.jlens_edits.empty() && slot.spec != nullptr) {
+        err = "jlens_interventions cannot be combined with speculative decoding "
+              "(the draft model is not steered)";
+        return false;
+    }
+
+    return true;
+}
+
+// Reconcile the slot's cached prefix with the intervention set it is about to run.
+void server_context::jlens_sync_slot_cache(server_slot& slot) {
+    const uint64_t h = jlens_edits_hash(slot.params.jlens_edits);
+    if (h == slot.jlens_cache_hash) {
+        return; // same edits as produced this slot's K/V: the prefix is reusable
+    }
+    LOG_INFO("jlens: intervention set changed, dropping the slot's cached prefix", {
+        {"id_slot", slot.id}, {"n_edits", (int) slot.params.jlens_edits.size()},
+    });
+    slot.jlens_cache_hash = h;
+    slot.cache_tokens.clear();
+    slot.server_cached_prompt.checkpoints.clear();
+    slot.n_past = 0;
+    slot.n_past_prompt = 0;
+    slot.n_prompt_tokens_cache = 0;
+}
+
 json server_context::get_formatted_generation(const server_slot& slot) const {
     const auto eos_bias = slot.sparams.logit_bias.find(llama_token_eos(model));
     const bool ignore_eos = eos_bias != slot.sparams.logit_bias.end() && eos_bias->second < 0.0f && std::isinf(eos_bias->second);
@@ -2555,6 +3462,10 @@ void server_context::send_partial_response(server_slot& slot, completion_token_o
         res->probs_output = { tkn }; // copy the token probs
         res->data["completion_probabilities"] = probs_vector_to_json(ctx, res->probs_output);
     }
+    if (slot.params.jlens_n_probs > 0) {
+        if (res->probs_output.empty()) res->probs_output = { tkn };
+        res->data["jlens_probabilities"] = jlens_vector_to_json(ctx, res->probs_output);
+    }
 
     if (slot.oaicompat) {
         res->data["oaicompat_token_ctr"] = slot.n_decoded;
@@ -2624,6 +3535,17 @@ void server_context::send_final_response(server_slot& slot) {
             slot.generated_token_probs.begin(),
             slot.generated_token_probs.end());
         res->data["completion_probabilities"] = probs_vector_to_json(ctx, res->probs_output);
+    }
+    if (slot.params.jlens_n_probs > 0) {
+        if (res->probs_output.empty()) {
+            res->probs_output = std::vector<completion_token_output>(
+                slot.generated_token_probs.begin(),
+                slot.generated_token_probs.end());
+        }
+        res->data["jlens_probabilities"] = jlens_vector_to_json(ctx, res->probs_output);
+    }
+    if (slot.params.jlens_prompt && !slot.jlens_prompt_probs.empty()) {
+        res->data["jlens_prompt_probabilities"] = jlens_prompt_to_json(ctx, slot.jlens_prompt_probs);
     }
 
     if (slot.oaicompat) {
@@ -3614,6 +4536,16 @@ void server_context::context_shift() {
                     send_error(slot, "context_length_exceeded: the request exceeds the available context size; context shift is disabled", ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                     continue;
                 }
+                // Position-scoped jlens_edits are absolute and incompatible with context shifts.
+                if (std::any_of(slot.params.jlens_edits.begin(), slot.params.jlens_edits.end(),
+                                [](const jlens_edit & e) { return e.pos_start != 0 || e.pos_end >= 0; })) {
+                    slot.print_timings();
+                    slot.release();
+                    send_error(slot, "context_length_exceeded: a position-scoped jlens_interventions entry cannot survive a context shift;"
+                                     "use an unbounded position range or a shorter generation",
+                               ERROR_TYPE_SERVER);
+                    continue;
+                }
                 // Shift context
                 int n_keep = slot.params.n_keep < 0 ? slot.prompt_tokens.size() : slot.params.n_keep;
                 if (add_bos_token) {
@@ -4322,11 +5254,21 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         ctx,
                         slot.uses_mtp() && slot.spec ? &slot : nullptr,
                     };
-                    mtmd_helper_eval_batch_callback mtp_media_callback =
-                        mtp_media_warmup.slot ? server_mtp_media_warmup_callback : nullptr;
+                    const auto & media_chunk = slot.prompt_tokens.find_chunk(slot.n_past_prompt);
+                    server_media_decode_hook media_hook {
+                        this,
+                        &slot,
+                        mtp_media_warmup.slot ? &mtp_media_warmup : nullptr,
+                        mtmd_input_chunk_get_type(media_chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE
+                            ? "image" : "audio",
+                        (int32_t) slot.n_past_prompt,
+                        p1,
+                    };
+                    jlens_media_begin(slot, p1);
                     int32_t res = slot.prompt_tokens.process_chunk(
                             ctx, mctx, slot.n_past_prompt, p1, slot.id, n_tokens_out,
-                            mtp_media_callback, &mtp_media_warmup);
+                            server_media_decode_callback, &media_hook);
+                    jlens_cap.begin_decode(false, 0);
                     if (res != 0) {
                         LLAMA_LOG_ERROR("failed to process image, res = %d\n", res);
                         slot.release();
@@ -4582,6 +5524,9 @@ void server_context::speculative_decoding_accept() {
 
             if (slot.sparams.n_probs > 0) {
                 populate_token_probs(slot, result, slot.params.post_sampling_probs, params_base.special, i);
+            }
+            if (slot.params.jlens_n_probs > 0) {
+                populate_jlens_probs(slot, result, i);
             }
 
             slot.ctx_sampling->n_rewind = 0;
@@ -4948,6 +5893,31 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             0, 0, 0, // unused
         };
 
+
+        bool jlens_want = false;
+        jlens_cap.begin_decode(false, (size_t) batch_view.n_tokens);
+        if (jlens != nullptr) {
+            for (auto & slot : slots) {
+                if (!slot.is_processing()) continue;
+                if (slot.params.jlens_n_probs > 0) jlens_want = true;
+                if (!slot.params.jlens_edits.empty()) {
+                    jlens_want = true;
+                    jlens_cap.add_edits(slot.id, slot.params.jlens_edits);
+                }
+            }
+            if (jlens_cap.has_edits()) {
+                // rows of this batch view -> (seq, position), so the callback can
+                // select the rows an intervention's position range covers
+                jlens_cap.row_seq.resize(batch_view.n_tokens);
+                jlens_cap.row_pos.resize(batch_view.n_tokens);
+                for (int32_t j = 0; j < batch_view.n_tokens; j++) {
+                    jlens_cap.row_seq[j] = batch_view.n_seq_id[j] > 0 ? batch_view.seq_id[j][0] : -1;
+                    jlens_cap.row_pos[j] = batch_view.pos[j];
+                }
+            }
+        }
+        jlens_cap.want = jlens_want;
+
         const int ret = server_decode(ctx, batch_view);
         if (ret != 0) {
             if (n_batch == 1 || ret < 0) {
@@ -4993,6 +5963,8 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             continue; // continue loop of n_batch
         }
+
+        collect_jlens_prompt_probs(batch_view);
 
     if (server_speculative_uses_target_features(params_base.speculative)) {
         for (auto & slot : slots) {
@@ -5139,6 +6111,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             result.text_to_send = common_token_to_piece(ctx, result.tok, accept_special_token(slot, result.tok));
             if (slot.sparams.n_probs > 0) {
                 populate_token_probs(slot, result, slot.params.post_sampling_probs, params_base.special, tok_idx);
+            }
+            if (slot.params.jlens_n_probs > 0) {
+                populate_jlens_probs(slot, result, tok_idx);
             }
 
             slot.ctx_sampling->n_rewind = 0;

@@ -252,16 +252,35 @@ std::string tokens_to_str(llama_context* ctx, const llama_tokens& tokens) {
 }
 
 // format incomplete utf-8 multibyte character for output
+// full UTF-8 well-formedness check (validate_utf8 only trims a truncation at the end)
+static bool is_valid_utf8_str(const std::string& s) {
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        unsigned char c = (unsigned char) s[i];
+        size_t extra;
+        if (c < 0x80)                { i++; continue; }
+        else if ((c & 0xE0) == 0xC0) { extra = 1; }
+        else if ((c & 0xF0) == 0xE0) { extra = 2; }
+        else if ((c & 0xF8) == 0xF0) { extra = 3; }
+        else return false; // invalid lead byte (incl. a lone continuation byte)
+        if (i + extra >= n) return false;
+        for (size_t k = 1; k <= extra; k++) {
+            if (((unsigned char) s[i + k] & 0xC0) != 0x80) return false;
+        }
+        i += extra + 1;
+    }
+    return true;
+}
+
  std::string tokens_to_output_formatted_string(const llama_context* ctx, const llama_token token) {
     std::string out = token == -1 ? "" : common_token_to_piece(ctx, token);
 
-    // if the size is 1 and first bit is 1, meaning it's a partial character
-    //   (size > 1 meaning it's already a known token)
-    if (out.size() == 1 && (out[0] & 0x80) == 0x80) {
-        std::stringstream ss;
-        ss << std::hex << (out[0] & 0xff);
-        std::string res(ss.str());
-        out = "byte: \\x" + res;
+    // A token piece can be a partial/invalid UTF-8 byte fragment, especially in jlens readouts.
+    if (!is_valid_utf8_str(out)) {
+        static const char hexd[] = "0123456789abcdef";
+        std::string esc = "byte:";
+        for (unsigned char b : out) { esc += " \\x"; esc += hexd[b >> 4]; esc += hexd[b & 0xF]; }
+        return esc;
     }
 
     return out;
@@ -498,6 +517,235 @@ json probs_vector_to_json(const llama_context* ctx, const std::vector<completion
             {"content", tok_str},
             {"probs",   probs_for_token},
             });
+    }
+
+    return out;
+}
+
+// convert the per-token Jacobian-lens readouts to json (parallels probs_vector_to_json)
+json jlens_vector_to_json(const llama_context* ctx, const std::vector<completion_token_output>& probs) {
+    json out = json::array();
+
+    for (const auto& prob : probs) {
+        json layers = json::array();
+        for (const auto& lp : prob.jlens_layers) {
+            json probs_for_layer = json::array();
+            for (const auto& p : lp.probs) {
+                probs_for_layer.push_back(json{
+                    {"id",      p.tok},
+                    {"tok_str", tokens_to_output_formatted_string(ctx, p.tok)},
+                    {"prob",    p.prob},
+                    });
+            }
+            layers.push_back(json{
+                {"layer", lp.layer},
+                {"probs", probs_for_layer},
+                });
+        }
+
+        out.push_back(json{
+            {"id",      prob.tok},
+            {"content", tokens_to_output_formatted_string(ctx, prob.tok)},
+            {"layers",  layers},
+            });
+    }
+
+    return out;
+}
+
+
+static std::string jlens_trim(const std::string& s) {
+    const char* ws = " \t\n\r";
+    const size_t b = s.find_first_not_of(ws);
+    if (b == std::string::npos) return "";
+    return s.substr(b, s.find_last_not_of(ws) - b + 1);
+}
+
+// one comma-separated field of a layer spec: "13,37" or an inclusive range "30-44"
+static bool jlens_parse_layer_field(const std::string& field, std::vector<int32_t>& out, std::string& err) {
+    const std::string tok = jlens_trim(field);
+    if (tok.empty()) return true; // stray/trailing comma
+
+    // strict base-10 parse: strtol alone would accept "12abc" and "0x10"
+    auto parse_int = [&](const std::string& raw, int32_t& v) -> bool {
+        const std::string s = jlens_trim(raw);
+        if (s.empty() || s.find_first_not_of("0123456789") != std::string::npos) {
+            err = "bad layer \"" + tok + "\": expected a number or a range like \"30-44\"";
+            return false;
+        }
+        try {
+            v = (int32_t) std::stol(s);
+        } catch (const std::exception&) {
+            err = "layer \"" + tok + "\" is out of range";
+            return false;
+        }
+        return true;
+    };
+
+    // search from 1 so a leading '-' stays part of the number and fails parse_int
+    const size_t dash = tok.find('-', 1);
+    if (dash == std::string::npos) {
+        int32_t v = 0;
+        if (!parse_int(tok, v)) return false;
+        out.push_back(v);
+        return true;
+    }
+
+    int32_t lo = 0, hi = 0;
+    if (!parse_int(tok.substr(0, dash), lo)) return false;
+    if (!parse_int(tok.substr(dash + 1), hi)) return false;
+    if (hi < lo) {
+        err = "bad layer range \"" + tok + "\": end is before start";
+        return false;
+    }
+    if ((size_t)(hi - lo + 1) > JLENS_MAX_LAYER_SPEC) {
+        err = "layer range \"" + tok + "\" spans more than " + std::to_string(JLENS_MAX_LAYER_SPEC) + " layers";
+        return false;
+    }
+    for (int32_t l = lo; l <= hi; l++) out.push_back(l);
+    return true;
+}
+
+// Parse a layer selection. Accepts a plain integer, a string holding a range, or an array.
+bool jlens_parse_layers(const json& spec, std::vector<int32_t>& out, std::string& err) {
+    out.clear();
+
+    auto add_string = [&](const std::string& s) -> bool {
+        size_t start = 0;
+        while (start <= s.size()) {
+            const size_t comma = s.find(',', start);
+            const size_t len = (comma == std::string::npos ? s.size() : comma) - start;
+            if (!jlens_parse_layer_field(s.substr(start, len), out, err)) return false;
+            if (out.size() > JLENS_MAX_LAYER_SPEC) {
+                err = "layer spec selects more than " + std::to_string(JLENS_MAX_LAYER_SPEC) + " layers";
+                return false;
+            }
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        return true;
+    };
+
+    if (spec.is_number_integer()) {
+        out.push_back(spec.get<int32_t>());
+    } else if (spec.is_string()) {
+        if (!add_string(spec.get<std::string>())) return false;
+    } else if (spec.is_array()) {
+        for (const auto& e : spec) {
+            if (e.is_number_integer()) {
+                out.push_back(e.get<int32_t>());
+            } else if (e.is_string()) {
+                if (!add_string(e.get<std::string>())) return false;
+            } else {
+                err = "layers: each entry must be a number or a string like \"30-44\"";
+                return false;
+            }
+            if (out.size() > JLENS_MAX_LAYER_SPEC) {
+                err = "layer spec selects more than " + std::to_string(JLENS_MAX_LAYER_SPEC) + " layers";
+                return false;
+            }
+        }
+    } else {
+        err = "layers must be a number, a string like \"18,24,30-44\", or an array";
+        return false;
+    }
+
+    // de-duplicate, keeping first-seen order
+    std::set<int32_t> seen;
+    size_t n = 0;
+    for (int32_t l : out) {
+        if (seen.insert(l).second) out[n++] = l;
+    }
+    out.resize(n);
+    return true;
+}
+
+
+bool jlens_parse_special(const json& j, uint32_t& out, std::string& err) {
+    out = 0;
+    if (j.is_null()) return true;
+    if (j.is_boolean()) { out = j.get<bool>() ? JLENS_SPECIAL_ALL : 0; return true; }
+    const json list = j.is_string() ? json::array({ j }) : j;
+    if (!list.is_array()) { err = "expected true/false, a category name or a list of them"; return false; }
+    for (const auto& name : list) {
+        bool found = false;
+        for (size_t i = 0; i < std::size(JLENS_SPECIAL_NAMES) && name.is_string(); i++) {
+            if (name.get<std::string>() == JLENS_SPECIAL_NAMES[i]) { out |= 1u << i; found = true; }
+        }
+        if (!found) {
+            err = "unknown category " + name.dump() + " (control, unused, user_defined, byte, unknown)";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool jlens_parse_mask(const json& j, int32_t n_layer, int32_t n_vocab, jlens_token_mask& out, std::string& err) {
+    out.assign(n_layer, {});
+    if (!j.is_object()) { err = "mask must be a json object"; return false; }
+    const json& map = j.contains("layers") ? j.at("layers") : j;
+    if (!map.is_object()) { err = "mask \"layers\" must be an object"; return false; }
+
+    for (const auto& [key, ids] : map.items()) {
+        if (&map == &j && (key == "meta" || key == "tokens")) continue;
+        if (!ids.is_array()) { err = "mask layer \"" + key + "\": expected an array of token ids"; return false; }
+
+        std::vector<int32_t> layers;
+        if (key == "*") {
+            for (int32_t l = 0; l < n_layer; l++) layers.push_back(l);
+        } else if (!jlens_parse_layers(json(key), layers, err)) {
+            err = "mask layer key \"" + key + "\": " + err;
+            return false;
+        }
+
+        for (const auto& id : ids) {
+            if (!id.is_number_integer() || id.get<int64_t>() < 0 || id.get<int64_t>() >= n_vocab) {
+                err = "mask layer \"" + key + "\": bad token id " + id.dump();
+                return false;
+            }
+            for (int32_t l : layers) {
+                if (l < n_layer) out[l].push_back(id.get<llama_token>());
+            }
+        }
+    }
+    for (auto& v : out) {
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+    }
+    return true;
+}
+
+// convert the prompt-position Jacobian-lens readouts to json
+json jlens_prompt_to_json(const llama_context* ctx, const std::vector<jlens_prompt_output>& rows) {
+    json out = json::array();
+
+    for (const auto& row : rows) {
+        json layers = json::array();
+        for (const auto& lp : row.layers) {
+            json probs_for_layer = json::array();
+            for (const auto& p : lp.probs) {
+                probs_for_layer.push_back(json{
+                    {"id",      p.tok},
+                    {"tok_str", tokens_to_output_formatted_string(ctx, p.tok)},
+                    {"prob",    p.prob},
+                    });
+            }
+            layers.push_back(json{
+                {"layer", lp.layer},
+                {"probs", probs_for_layer},
+                });
+        }
+
+        json item = json{
+            {"pos",     row.pos},
+            {"id",      row.tok},   // LLAMA_TOKEN_NULL (-1) at media positions
+            {"content", tokens_to_output_formatted_string(ctx, row.tok)},
+            {"layers",  layers},
+            };
+        if (row.media != nullptr) {
+            item["media"] = row.media;
+        }
+        out.push_back(std::move(item));
     }
 
     return out;

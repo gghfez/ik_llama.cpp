@@ -5629,6 +5629,20 @@ GGML_CALL bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
 }
 
+GGML_CALL bool ggml_backend_cuda_set_use_graphs(ggml_backend_t backend, bool use) {
+#ifdef USE_CUDA_GRAPH
+    if (!ggml_backend_is_cuda(backend)) return false;
+    auto * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    const bool prev = cuda_ctx->use_cuda_graph;
+    cuda_ctx->use_cuda_graph = use;
+    return prev;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(use);
+    return false;
+#endif
+}
+
 GGML_CALL int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }

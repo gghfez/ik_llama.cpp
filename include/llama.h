@@ -823,6 +823,61 @@ extern "C" {
                          int32_t   il_end);
 
     //
+    // Jacobian lens (jlens)
+    //
+    // A pre-fit Jacobian lens: a per-layer matrix J_l [d_model x d_model] that maps
+    // the residual stream at layer l into the final-layer basis. Reading out at layer l
+    // is  logits_l = model.output( model.output_norm( h_l @ J_l^T ) ), reusing the
+    // model's own unembedding so the result is comparable to the model's real logits.
+    struct llama_jlens;
+
+    // Any value >= 0 is a backend device index
+    enum llama_jlens_device {
+        LLAMA_JLENS_DEVICE_AUTO = -2, // same backend buffer type as the model's output (lm_head)
+        LLAMA_JLENS_DEVICE_CPU  = -1, // host memory
+    };
+
+    LLAMA_API struct llama_jlens * llama_jlens_load(const char * path, const struct llama_model * model, int32_t device);
+    LLAMA_API void                 llama_jlens_free(struct llama_jlens * jl);
+
+    // Number of fitted source layers, and a pointer to the sorted layer ids.
+    LLAMA_API int32_t              llama_jlens_n_layers(const struct llama_jlens * jl);
+    LLAMA_API const int32_t *      llama_jlens_layers  (const struct llama_jlens * jl);
+    LLAMA_API bool                 llama_jlens_has_layer(const struct llama_jlens * jl, int32_t layer);
+
+    // Compute lens logits for a single position.
+    LLAMA_API bool llama_jlens_compute(
+            struct llama_context * ctx,
+            struct llama_jlens   * jl,
+                   const int32_t * layers,
+                         int32_t   n_layers,
+                     const float * residuals,
+                            bool   use_jacobian, // false = skip J_l, plain logit-lens
+                           float * out_logits);
+
+    // Batched readout: llama_jlens_compute but for n_pos positions at once, softmax probs rather than logits.
+    LLAMA_API bool llama_jlens_compute_batch(
+            struct llama_context * ctx,
+            struct llama_jlens   * jl,
+                   const int32_t * layers,
+                         int32_t   n_layers,
+                         int32_t   n_pos,
+                     const float * residuals,
+                            bool   use_jacobian,
+                           float * out_probs);
+
+    // J-lens vectors for one token: v_l = J_l^T (gamma * W_U[token]), the direction in
+    // layer-l residual space whose amplification raises that token's lens logit
+    LLAMA_API bool llama_jlens_vectors(
+            struct llama_context * ctx,
+            struct llama_jlens   * jl,
+                   const int32_t * layers,
+                         int32_t   n_layers,
+                     llama_token   token,
+                            bool   unit,
+                           float * out_vecs);
+
+    //
     // KV cache
     //
 
