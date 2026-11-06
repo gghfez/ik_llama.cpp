@@ -220,6 +220,12 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q1_0_G128_R8  = 160, // except 1d tensors, 38 to be compatible with mainline
         LLAMA_FTYPE_MOSTLY_PQ2_0_R8      = 161, // except 1d tensors (Prism ternary, group-128)
         LLAMA_FTYPE_MOSTLY_PTQ1_0_R8     = 162, // except 1d tensors (Prism ternary, base-3)
+        LLAMA_FTYPE_MOSTLY_TQK6          = 163, // except 1d tensors (trellis, group-128)
+        LLAMA_FTYPE_MOSTLY_TQK7          = 164, // except 1d tensors (trellis, group-128)
+        LLAMA_FTYPE_MOSTLY_TQ2_T         = 165, // except 1d tensors (trellis, group-128)
+        LLAMA_FTYPE_MOSTLY_TQP5          = 166, // except 1d tensors (trellis, group-128)
+        LLAMA_FTYPE_MOSTLY_TQP6          = 167, // except 1d tensors (trellis, group-128)
+        LLAMA_FTYPE_MOSTLY_TQP7          = 168, // except 1d tensors (trellis, group-128)
         LLAMA_FTYPE_MOSTLY_Q4_0_R8       = 202, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q8_0_R8       = 207, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q5_0_R4       = 208, // except 1d tensors
@@ -250,6 +256,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_IQ5_KS_R16    = 348, // except 1d tensors (16-row interleaved iq3ks-class codebook 3-bit)
         LLAMA_FTYPE_MOSTLY_IQ5_KS_R4     = 350, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_MXFP4_R8      = 351, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q2_0_R8       = 352, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q8_K_R16      = 397, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q8_KV_R8      = 398, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q8_K_R8       = 399, // except 1d tensors
@@ -307,7 +314,8 @@ extern "C" {
 
     typedef struct llama_ckpt_data {
         enum llama_ckpt_type type;
-        llama_pos pos;
+        llama_pos pos1;
+        llama_pos pos2;
     } llama_ckpt_data;
 
     typedef struct llama_token_data {
@@ -449,6 +457,7 @@ extern "C" {
         bool merge_qkv;     // if true, merge separate Q, K, V tensors into a single, contiguous tensor
         bool merge_up_gate_exps;  // if true, merge ffn_up_exps and ffn_gate_exps tensors into a single, contiguous tensor
         bool mtp;           // if true, load MTP layers if present
+        bool dsa;           // if true, load the MiniMax-M3 sparse attention indexer if present
         bool dry_run;       // skip loading tensors
         bool flash_attn;
         bool defer_experts;    // defer expert mmap residency to speed up model loading (Linux only)
@@ -713,6 +722,34 @@ extern "C" {
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
 
+    struct llama_memory_buft {
+        ggml_backend_buffer_type_t buft;
+        size_t                     size;
+    };
+
+    struct llama_memory_row {
+        char   name[96];
+        bool   is_device;
+        size_t model;
+        size_t context;
+        size_t compute;
+        size_t mmproj;
+        size_t total;
+        size_t free;
+    };
+
+    // Fills one row per offload device, then the host, then one row per other buffer type in use.
+    // Sums the memory of all contexts in ctxs, such as a target and its draft contexts.
+    // A context listed twice, or weights that several contexts share, are counted once.
+    // Returns the number of rows, which can be larger than n_rows.
+    LLAMA_API int32_t llama_memory_breakdown(
+            const struct llama_context * const * ctxs,
+                                   int32_t   n_ctxs,
+            const struct llama_memory_buft * mmproj,
+                                   int32_t   n_mmproj,
+                  struct llama_memory_row * rows,
+                                   int32_t   n_rows);
+
     // Returns the total number of parameters in the model
     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
 
@@ -972,6 +1009,8 @@ extern "C" {
     LLAMA_API bool llama_rewind_ckpt_discard(struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id);
 
     LLAMA_API bool llama_rewind_ckpt_release(struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id);
+
+    LLAMA_API llama_pos llama_rewind_ckpt_pos(struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id);
 
 
     // Restore the recurrent state after speculative decode.

@@ -1155,7 +1155,7 @@ if (CMAKE_OSX_ARCHITECTURES      STREQUAL "arm64" OR
     endif()
 elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LWR MATCHES "^(x86_64|i686|amd64|x64|win32)$" OR
         (NOT CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_GENERATOR_PLATFORM_LWR AND
-         CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|i686|AMD64)$"))
+         CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|i686|AMD64|amd64)$"))
     message(STATUS "x86 detected")
     if (MSVC)
         # instruction set detection for MSVC only
@@ -1238,6 +1238,14 @@ elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LW
         endif()
         if (GGML_AVX512_BF16)
             list(APPEND ARCH_FLAGS -mavx512bf16)
+        endif()
+        if (GGML_USE_I32GATHER)
+            message(STATUS "Prefer ZMM Gather Instructions")
+            add_compile_definitions(GGML_USE_I32GATHER)
+        endif()
+        if (GGML_CPU_INTEL_CLIENT)
+            message(STATUS "Build for Intel Client CPUs")
+            add_compile_definitions(GGML_CPU_INTEL_CLIENT)
         endif()
     endif()
 elseif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "ppc64")

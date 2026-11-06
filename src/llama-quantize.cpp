@@ -122,6 +122,7 @@ std::pair<ggml_type, int> interleaved_properties(ggml_type type) {
         { GGML_TYPE_PQ2_0_R8,    { GGML_TYPE_PQ2_0, 8} },
         { GGML_TYPE_PTQ1_0_R8,   { GGML_TYPE_PTQ1_0, 8} },
         { GGML_TYPE_Q8_KV_R8,    { GGML_TYPE_Q8_KV, 8} },
+        { GGML_TYPE_Q2_0_R8,     { GGML_TYPE_Q2_0, 8} },
         { GGML_TYPE_Q8_K_R8,     { GGML_TYPE_Q8_0, 8} },
         { GGML_TYPE_Q8_K_R16,    { GGML_TYPE_Q8_0, 16} },
         { GGML_TYPE_BF16_R16,    { GGML_TYPE_BF16, 16} },
@@ -129,6 +130,16 @@ std::pair<ggml_type, int> interleaved_properties(ggml_type type) {
     };
     if (auto it = k_map.find(type); it != k_map.end()) return it->second;
     return {type, 1};
+}
+
+// The halves of a qwen4exp merged weight pair are loaded as row views, so they must not split an interleaved row group
+static bool splits_merged_pair(const llama_model & model, const std::string & name, ggml_type type) {
+    if (model.arch != LLM_ARCH_QWEN4EXP) return false;
+    int64_t rows_b = 0;
+    if      (name.find("_down_inject.weight")   != std::string::npos) rows_b = model.hparams.dsv4_hc_mult;
+    else if (name.find("attn_qkv_gate.weight")  != std::string::npos) rows_b = model.hparams.ssm_d_inner;
+    else if (name.find("ssm_beta_alpha.weight") != std::string::npos) rows_b = model.hparams.ssm_dt_rank;
+    return rows_b % interleaved_properties(type).second != 0;
 }
 
 static void llama_tensor_dequantize_internal(
@@ -351,6 +362,15 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
 
     // TODO: avoid hardcoded tensor names - use the TN_* constants
     const llm_arch arch = qs.model.arch;
+
+    // Raon-1: keep MLA latents at source precision for Q6_K/Q8_0.
+    if (arch == LLM_ARCH_RAON1 &&
+            (ftype == LLAMA_FTYPE_MOSTLY_Q6_K || ftype == LLAMA_FTYPE_MOSTLY_Q8_0) &&
+            (name.find("attn_kv_a_mqa.weight") != std::string::npos ||
+             name.find("attn_k_b.weight")      != std::string::npos ||
+             name.find("attn_v_b.weight")      != std::string::npos)) {
+        return tensor->type;
+    }
     const auto       tn = LLM_TN(arch);
 
     auto use_more_bits = [](int i_layer, int n_layers) -> bool {
@@ -1324,6 +1344,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         case LLAMA_FTYPE_MOSTLY_IQ4_NL_R4:default_type = GGML_TYPE_IQ4_NL_R4;break;
         case LLAMA_FTYPE_MOSTLY_IQ4_XS_R8:default_type = GGML_TYPE_IQ4_XS_R8;break;
         case LLAMA_FTYPE_MOSTLY_Q4_0_R8: default_type = GGML_TYPE_Q4_0_R8; break;
+        case LLAMA_FTYPE_MOSTLY_Q2_0_R8: default_type = GGML_TYPE_Q2_0_R8; break;
         case LLAMA_FTYPE_MOSTLY_Q5_0_R4: default_type = GGML_TYPE_Q5_0_R4; break;
         case LLAMA_FTYPE_MOSTLY_Q6_0_R4: default_type = GGML_TYPE_Q6_0_R4; break;
         case LLAMA_FTYPE_MOSTLY_Q8_0_R8: default_type = GGML_TYPE_Q8_0_R8; break;
@@ -1486,6 +1507,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
         if (params->only_repack) {
             auto repacked_type = (ggml_type)iqk_repacked_type(meta);
+            if (splits_merged_pair(model, name, repacked_type)) repacked_type = meta->type;
             bool repack = false, modify = false;
             if (repacked_type != meta->type) {
                 repack = true;
@@ -1523,7 +1545,11 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             printf("=========================== %s: nothing to do for only_repack option\n", __func__);
             return;
         }
-        ftype = repacked_ftype(model.ftype);
+        // Keep the requested ftype when the source has no known mapping.
+        auto repacked = repacked_ftype(model.ftype);
+        ftype = repacked != model.ftype ? repacked
+              : params->ftype != LLAMA_FTYPE_ALL_F32 ? params->ftype
+              : model.ftype;
         printf("===================== Model ftype: %s: Repacked ftype: %s\n", llama_model_ftype_name(model.ftype).c_str(),
                 llama_model_ftype_name(ftype).c_str());
     }
@@ -1740,6 +1766,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         // NOTE: can't use LLM_TN here because the layer number is not known
         quantize &= name.find("ssm_conv1d")        == std::string::npos;
         quantize &= name.find("shortconv.conv")     == std::string::npos;
+        quantize &= name.find("ple_conv1d")        == std::string::npos;
         quantize &= name.find("ssm_x.weight")      == std::string::npos;
         quantize &= name.find("ssm_dt.weight")     == std::string::npos;
 
@@ -1756,6 +1783,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
         if (params->only_repack) {
             ggml_type repacked_type = (ggml_type)iqk_repacked_type(tensor);
+            if (splits_merged_pair(model, name, repacked_type)) repacked_type = tensor->type;
             bool modify = !is_repacked && iqk_should_modify_tensor(tensor);
             if ((modify || repacked_type != tensor->type) && repack_pattern) {
                 bool found = false;
@@ -1900,6 +1928,12 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                     } else if (auto pos2 = name.find("ffn_gate.weight"); pos2 != std::string::npos) {
                         auto up_name = name.substr(0, pos2) + "ffn_up.weight";
                         it = imatrix_data->find(up_name);
+                    } else if (auto pos3 = name.find("_down_inject.weight"); pos3 != std::string::npos) {
+                        it = imatrix_data->find(name.substr(0, pos3) + "_down.weight");
+                    } else if (auto pos4 = name.find("attn_qkv_gate.weight"); pos4 != std::string::npos) {
+                        it = imatrix_data->find(name.substr(0, pos4) + "attn_qkv.weight");
+                    } else if (auto pos5 = name.find("ssm_beta_alpha.weight"); pos5 != std::string::npos) {
+                        it = imatrix_data->find(name.substr(0, pos5) + "ssm_beta.weight");
                     } else {
                         // MLA hack: most imatrix files floating around the Internet have been computed with standard attention.
                         //           This means that the imatrix file does not contain data for the *.attn_k_b.weight and *.attn_v_b.weight
@@ -1963,7 +1997,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
             int chunk_size_multiplier = 1;
             auto [working_type, num_rows] = interleaved_properties(new_type);
-            if (tensor->ne[1] % num_rows != 0) {
+            if (tensor->ne[1] % num_rows != 0 || splits_merged_pair(model, name, new_type)) {
                 new_type = change_type_if_necessary(working_type, tensor->ne[0], tensor->ne[1]);
                 if (new_type != working_type) ++qs.n_fallback;
             } else {

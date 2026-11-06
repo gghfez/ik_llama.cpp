@@ -101,6 +101,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MUSE_GLIMMER,    "muse-glimmer" },
     { LLM_ARCH_LFM2,            "lfm2"         },
     { LLM_ARCH_LFM2MOE,         "lfm2moe"      },
+    { LLM_ARCH_LFM3,            "lfm3"         },
     { LLM_ARCH_MAPLE,           "maple"        },
     { LLM_ARCH_SPARK2_5,        "spark2_5"     },
     { LLM_ARCH_RAON1,           "raon1"        },
@@ -225,6 +226,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,     "%s.attention.indexer.key_length"     },
     { LLM_KV_ATTENTION_INDEXER_TOP_K,          "%s.attention.indexer.top_k"          },
     { LLM_KV_ATTENTION_INDEXER_KPOOL,          "%s.attention.indexer.kpool"          },
+    { LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,     "%s.attention.indexer.block_size"     },
     { LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,     "%s.attention.output_group_count"     },
     { LLM_KV_ATTENTION_OUTPUT_LORA_RANK,       "%s.attention.output_lora_rank"       },
     { LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,"%s.attention.compress_rope_freq_base"},
@@ -390,6 +392,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
     case LLM_ARCH_GLM5NEXT:
     case LLM_ARCH_LFM2:
     case LLM_ARCH_LFM2MOE:
+    case LLM_ARCH_LFM3:
     case LLM_ARCH_RAON1:
         return true;
     default:

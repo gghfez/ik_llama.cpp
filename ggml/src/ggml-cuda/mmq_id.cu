@@ -66,8 +66,8 @@ static __global__ void mmq_ids_helper(
         }
     } else {
         // Implementation optimized for specific numbers of experts used:
-        static_assert(n_expert_used == 6 || warp_size % n_expert_used == 0, "bad n_expert_used");
-        const int neu_padded = n_expert_used == 6 ? 8 : n_expert_used; // Padded to next higher power of 2.
+        constexpr int neu_padded = n_expert_used_template == 6 ? 8 : n_expert_used_template == 10 ? 16 : n_expert_used_template;
+        static_assert(neu_padded <= warp_size && warp_size % neu_padded == 0, "bad n_expert_used");
         for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
             const int it = it0 + threadIdx.x / neu_padded;
 
@@ -281,6 +281,24 @@ static void ggml_cuda_mul_mat_q_switch_type_id(ggml_backend_cuda_context & ctx, 
         case GGML_TYPE_IQ4_KT:
             mul_mat_q_case_id<GGML_TYPE_IQ4_KT>(ctx, args, stream);
             break;
+        case GGML_TYPE_TQ2_T:
+            mul_mat_q_case_id<GGML_TYPE_TQ2_T>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQK6:
+            mul_mat_q_case_id<GGML_TYPE_TQK6>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQK7:
+            mul_mat_q_case_id<GGML_TYPE_TQK7>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQP5:
+            mul_mat_q_case_id<GGML_TYPE_TQP5>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQP6:
+            mul_mat_q_case_id<GGML_TYPE_TQP6>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQP7:
+            mul_mat_q_case_id<GGML_TYPE_TQP7>(ctx, args, stream);
+            break;
         default:
             GGML_ABORT("fatal error");
             break;
@@ -450,6 +468,10 @@ void ggml_cuda_mul_mat_q_id(ggml_backend_cuda_context & ctx, const ggml_tensor *
                 launch_mmq_ids_helper< 8> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
                     ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
                 break;
+            case 10:
+                launch_mmq_ids_helper<10> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                break;
             case 16:
                 launch_mmq_ids_helper<16> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
                     ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
@@ -560,6 +582,12 @@ bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
         case GGML_TYPE_IQ2_KT:
         case GGML_TYPE_IQ3_KT:
         case GGML_TYPE_IQ4_KT:
+        case GGML_TYPE_TQ2_T:
+        case GGML_TYPE_TQK6:
+        case GGML_TYPE_TQK7:
+        case GGML_TYPE_TQP5:
+        case GGML_TYPE_TQP6:
+        case GGML_TYPE_TQP7:
             mmq_supported = true;
             break;
         default:

@@ -54,8 +54,12 @@
 #include <io.h>
 #else
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
 #endif
 #if defined(LLAMA_USE_CURL)
 #include <curl/curl.h>
@@ -909,6 +913,20 @@ static void common_speculative_finalize_stages(gpt_params & params) {
     params.has_mtp = spec.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
 }
 
+void gpt_params_terminate_lists(gpt_params & params) {
+    if (!params.kv_overrides.empty()) {
+        params.kv_overrides.emplace_back();
+        params.kv_overrides.back().key[0] = 0;
+    }
+    if (!params.tensor_buft_overrides.empty()) {
+        params.tensor_buft_overrides.push_back({nullptr, nullptr});
+    }
+    if (!params.fit_margin_array.empty()) {
+        params.fit_margin_array.push_back(-1);
+        params.fit_margin_array.push_back(0);
+    }
+}
+
 bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
     bool invalid_param = false;
     std::string arg;
@@ -959,17 +977,7 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
         string_process_escapes(rep.second);
     }
 
-    if (!params.kv_overrides.empty()) {
-        params.kv_overrides.emplace_back();
-        params.kv_overrides.back().key[0] = 0;
-    }
-    if (!params.tensor_buft_overrides.empty()) {
-        params.tensor_buft_overrides.push_back({nullptr, nullptr});
-    }
-    if (!params.fit_margin_array.empty()) {
-        params.fit_margin_array.push_back(-1);
-        params.fit_margin_array.push_back(0);
-    }
+    gpt_params_terminate_lists(params);
 
     if (!params.chat_template.empty() && !common_chat_verify_template(params.chat_template, params.use_jinja)) {
         throw std::runtime_error(string_format(
@@ -1006,6 +1014,7 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_CHAT_TEMPLATE",    params.chat_template);
     get_env("LLAMA_ARG_N_PREDICT",        params.n_predict);
     get_env("LLAMA_ARG_ENDPOINT_METRICS", params.endpoint_metrics);
+    get_env("LLAMA_ARG_ENDPOINT_MEMORY",  params.endpoint_memory);
     get_env("LLAMA_ARG_ENDPOINT_SLOTS",   params.endpoint_slots);
     get_env("LLAMA_ARG_EMBEDDINGS",       params.embedding);
     get_env("LLAMA_ARG_FLASH_ATTN",       params.flash_attn);
@@ -2948,6 +2957,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.endpoint_metrics = true;
         return true;
     }
+    if (arg == "--memory") {
+        params.endpoint_memory = true;
+        return true;
+    }
     if (arg == "--slot-save-path") {
         CHECK_ARG
         params.slot_save_path = argv[i];
@@ -3387,7 +3400,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-no-fa, --no-flash-attn",       "disable Flash Attention (default: %s)", params.flash_attn ? "enabled" : "disabled" });
     options.push_back({ "*",           "-fa, --flash-attn (auto|on|off|0|1)", "set Flash Attention (default: %s)", params.flash_attn ? "on" : "off" });
     options.push_back({ "*",           "-mla,  --mla-use",              "enable MLA (default: %d)", params.mla_attn });
-    options.push_back({ "*",           "-dsa,  --dsa",                  "enable GLM DSA sparse attention (GLM-DSA arch only; default: %s)", params.dsa ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-dsa,  --dsa",                  "enable sparse attention (GLM-DSA; MiniMax-M3 on the CPU backend; default: %s)", params.dsa ? "enabled" : "disabled" });
     options.push_back({ "*",           "-fidx,  --fused-indexer-topk",  "enable the fused indexer topk op (DSA only; default: %s)", params.fused_idx_topk ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-fidx, --no-fused-indexer-topk", "disable the fused indexer topk op (DSA only; default: %s)", params.fused_idx_topk ? "enabled" : "disabled" });
     options.push_back({ "*",           "        --swa-compress",         "allocate sliding-window layers at window size instead of n_ctx (default: %s)", params.swa_compress ? "enabled" : "disabled" });
@@ -3768,6 +3781,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "server",      "       --log-format {text,json}",
                                                                         "log output format: json or text (default: text)" });
     options.push_back({ "server",      "       --metrics",              "enable prometheus compatible metrics endpoint (default: %s)", params.endpoint_metrics ? "enabled" : "disabled" });
+    options.push_back({ "server",      "       --memory",               "enable the /memory endpoint reporting per-device memory use (default: %s)", params.endpoint_memory ? "enabled" : "disabled" });
     options.push_back({ "server",      "       --no-slots",             "disables slots monitoring endpoint (default: %s)", params.endpoint_slots ? "enabled" : "disabled" });
     options.push_back({ "server",      "       --slot-save-path PATH",  "path to save slot kv cache (default: disabled)" });
     options.push_back({ "server",      "       --chat-template JINJA_TEMPLATE",
@@ -4679,6 +4693,7 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.merge_qkv       = params.merge_qkv;
     mparams.merge_up_gate_exps = params.merge_up_gate_exps;
     mparams.mtp             = params.has_mtp || params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+    mparams.dsa             = params.dsa;
     mparams.flash_attn      = params.flash_attn;
     mparams.defer_experts   = params.defer_experts;
     mparams.defer_ple       = params.defer_ple;
@@ -4721,6 +4736,17 @@ static ggml_type ggml_type_from_str(const std::string & s) {
         return GGML_TYPE_Q8_0;
     }
     throw std::runtime_error("Invalid graph reduce type: " + s);
+}
+
+void common_check_v_cache_types(const llama_context_params & cparams) {
+    if (cparams.flash_attn) {
+        return;
+    }
+    if (ggml_is_quantized(cparams.type_v) ||
+        (ggml_is_quantized(cparams.type_v_first) && cparams.n_v_first > 0) ||
+        (ggml_is_quantized(cparams.type_v_last)  && cparams.n_v_last  > 0)) {
+        throw std::runtime_error("Quantized V cache cannot be used without flash attention");
+    }
 }
 
 struct llama_context_params common_context_params_to_llama(const gpt_params & params) {
@@ -4789,9 +4815,6 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.idx_type_k = kv_cache_type_from_str(params.indexer_cache_type_k);
     cparams.type_reduce = ggml_type_from_str(params.reduce_type);
     cparams.type_graph_attn = ggml_type_from_str(params.graph_attn_precision);
-    if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v)) {
-        throw std::runtime_error("Quantized V cache cannot be used without flash attention");
-    }
     cparams.type_k_first    = kv_cache_type_from_str(params.type_k_first);
     cparams.type_k_last     = kv_cache_type_from_str(params.type_k_last );
     cparams.type_v_first    = kv_cache_type_from_str(params.type_v_first);
@@ -4800,12 +4823,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.n_k_last        = params.n_k_last;
     cparams.n_v_first       = params.n_v_first;
     cparams.n_v_last        = params.n_v_last;
-    if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v_first) && cparams.n_v_first > 0) {
-        throw std::runtime_error("Quantized V cache cannot be used without flash attention");
-    }
-    if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v_last) && cparams.n_v_last > 0) {
-        throw std::runtime_error("Quantized V cache cannot be used without flash attention");
-    }
+    common_check_v_cache_types(cparams);
 
     if (!params.offload_policy.empty()) cparams.offload_policy = (void *)&params.offload_policy;
     if (!params.cuda_params.empty()) cparams.cuda_params = (void *)params.cuda_params.data();
@@ -5584,6 +5602,57 @@ llama_control_vector_data llama_control_vector_load(const std::vector<llama_cont
     }
 
     return result;
+}
+
+//
+// Memory utils
+//
+
+double common_rss_hwm_mib() {
+#ifdef _WIN32
+    return -1.0;
+#else
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        return -1.0;
+    }
+#ifdef __APPLE__
+    return usage.ru_maxrss / (1024.0 * 1024.0);
+#else
+    return usage.ru_maxrss / 1024.0;
+#endif
+#endif
+}
+
+void common_vram_tracker::start() {
+#ifdef GGML_USE_CUDA
+    const int count = ggml_backend_cuda_get_device_count();
+    baseline.resize(count);
+    for (int device = 0; device < count; ++device) {
+        size_t free;
+        size_t total;
+        ggml_backend_cuda_get_device_memory(device, &free, &total);
+        baseline[device] = free;
+    }
+#endif
+}
+
+double common_vram_tracker::sample() const {
+#ifdef GGML_USE_CUDA
+    if (baseline.empty()) {
+        return -1.0;
+    }
+    size_t used = 0;
+    for (int device = 0; device < (int) baseline.size(); ++device) {
+        size_t free;
+        size_t total;
+        ggml_backend_cuda_get_device_memory(device, &free, &total);
+        used += baseline[device] > free ? baseline[device] - free : 0;
+    }
+    return used / (1024.0 * 1024.0);
+#else
+    return -1.0;
+#endif
 }
 
 //

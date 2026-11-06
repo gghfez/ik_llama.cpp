@@ -26,6 +26,7 @@
 #include "ggml-cuda/dmmv.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/fma.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -575,6 +576,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
         if (cublas_handles[i] != nullptr) {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
+        }
+        for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+            if (cublas_workspaces[i][j] != nullptr) {
+                CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
+            }
         }
     }
     auto info = const_cast<ggml_cuda_device_info*>(&ggml_cuda_info());
@@ -1822,7 +1828,7 @@ static void ggml_cuda_op_mul_mat_cublas(
         const float alpha_f32 = 1.0f;
         const float beta_f32  = 0.0f;
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        ctx.cublas_handle(id, stream);
         CUBLAS_CHECK(
             cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
@@ -1860,7 +1866,7 @@ static void ggml_cuda_op_mul_mat_cublas(
             const float alpha_f32 = 1.0f;
             const float beta_f32  = 0.0f;
 
-            CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+            ctx.cublas_handle(id, stream);
             CUBLAS_CHECK(
                     cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                         row_diff, src1_ncols, ne10,
@@ -1904,7 +1910,7 @@ static void ggml_cuda_op_mul_mat_cublas(
         const half alpha_f16 = 1.0f;
         const half beta_f16 = 0.0f;
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        ctx.cublas_handle(id, stream);
         CUBLAS_CHECK(
             cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
@@ -1939,7 +1945,7 @@ static void ggml_cuda_op_mul_mat_cublas(
         const float alpha = 1.0f;
         const float beta = 0.0f;
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        ctx.cublas_handle(id, stream);
         CUBLAS_CHECK(
             cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
@@ -2392,7 +2398,7 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
 
     const int64_t ne_dst = ggml_nelements(dst);
     cudaStream_t main_stream = ctx.stream();
-    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), main_stream));
+    ctx.cublas_handle(ctx.device, main_stream);
 
     float * dst_ddf = (float *) dst->data;
     const size_t ts_src1 = ggml_type_size(src1->type);
@@ -3139,6 +3145,15 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         const ggml_cgraph * graph, int i) {
     ggml_tensor * next = i + 1 < graph->n_nodes ? graph->nodes[i+1] : nullptr;
+    ggml_tensor * hada = nullptr;
+    if (next && next->op != GGML_OP_MUL_MAT_ID) {
+        if (i + 2 < graph->n_nodes &&
+            graph->nodes[i+1]->op == GGML_OP_HADAMARD &&
+            graph->nodes[i+2]->op == GGML_OP_MUL_MAT_ID) {
+            hada = graph->nodes[i+1];
+            next = graph->nodes[i+2];
+        }
+    }
 
     const ggml_tensor * src0_1 = dst->src[0];
     const ggml_tensor * src0_2 = dst->src[1];
@@ -3247,8 +3262,16 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
             auto dst_row_size = dst_padded_col_size*sizeof(block_q8_1)/QK8_1;
             auto dst_ddq_size = n_ids*dst_row_size;
             ggml_cuda_pool_alloc<char> dst_quantized(ctx.pool(), dst_ddq_size*Ny);
-            quantize_row_q8_1_cuda((const float *)dst->data, (void *)dst_quantized.get(), dst->ne[0], n_ids*Ny, 1,
-                    dst_padded_col_size, next->src[0]->type, stream);
+            int delta = 2;
+            if (hada) {
+                delta = 3;
+                ggml_cuda_op_hadamard(ctx, hada);
+                quantize_row_q8_1_cuda((const float *)hada->data, (void *)dst_quantized.get(), dst->ne[0], n_ids*Ny, 1,
+                        dst_padded_col_size, next->src[0]->type, stream);
+            } else {
+                quantize_row_q8_1_cuda((const float *)dst->data, (void *)dst_quantized.get(), dst->ne[0], n_ids*Ny, 1,
+                        dst_padded_col_size, next->src[0]->type, stream);
+            }
             CUDA_CHECK(cudaGetLastError());
 
             local_dst.ne[2] = 1;
@@ -3265,19 +3288,19 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
             auto local_src0 = *next->src[0];
             local_src0.ne[2] = local_src0.ne[3] = 1;
 
-            int result = i + 1;
+            int result = i + delta - 1;
 
             //printf("next: %ld x %ld x %ld x %ld,    %zu x %zu x %zu x %zu\n", next->ne[0], next->ne[1], next->ne[2], next->ne[3], next->nb[0], next->nb[1], next->nb[2], next->nb[3]);
 
             for (int iy = 0; iy < Ny; ++iy) {
                 local_ids.data  = (char *)ids->data + iy*ids->nb[1];
                 auto this_dst_quantized = dst_quantized.get() + iy*dst_ddq_size;
-                if (i+2 < graph->n_nodes &&
-                    graph->nodes[i+2]->op == GGML_OP_ADD_ID &&
-                    graph->nodes[i+2]->src[0] == next &&
-                    graph->nodes[i+2]->src[2] == ids) {
-                    ggml_cuda_op_mul_mat_vec_q_id(ctx, &local_src0, &local_src1, &local_ids, &local_next, graph->nodes[i+2]->src[1],
-                            (const char *)next->src[0]->data, nullptr, this_dst_quantized, (float *)graph->nodes[i+2]->data + iy*next->ne[0]*n_ids,
+                if (i+delta < graph->n_nodes &&
+                    graph->nodes[i+delta]->op == GGML_OP_ADD_ID &&
+                    graph->nodes[i+delta]->src[0] == next &&
+                    graph->nodes[i+delta]->src[2] == ids) {
+                    ggml_cuda_op_mul_mat_vec_q_id(ctx, &local_src0, &local_src1, &local_ids, &local_next, graph->nodes[i+delta]->src[1],
+                            (const char *)next->src[0]->data, nullptr, this_dst_quantized, (float *)graph->nodes[i+delta]->data + iy*next->ne[0]*n_ids,
                             0, next->src[0]->ne[1], 1, dst_padded_col_size, stream);
                     if (iy == 0) {
                         ++result;
@@ -3401,7 +3424,7 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
         }
         CUDA_CHECK(cudaGetLastError());
 
-        if (next && next->op == GGML_OP_MUL_MAT_ID && ggml_is_quantized(next->src[0]->type) &&
+        if (next && !hada && next->op == GGML_OP_MUL_MAT_ID && ggml_is_quantized(next->src[0]->type) &&
             ggml_cuda_should_use_mmq(next->src[0]->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[2])) {
             //ggml_cuda_mul_mat_q_id(ctx, next->src[0], dst, ids, next, (char *)ids_device.get(), nullptr);
             ggml_cuda_mul_mat_q_id(ctx, next->src[0], dst, ids, next, nullptr, nullptr);
@@ -3445,7 +3468,7 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
     dst_row.nb[2] = nb1;
     dst_row.nb[3] = nb1;
 
-    bool fuse_down = next && next->op == GGML_OP_MUL_MAT_ID;
+    bool fuse_down = next && !hada && next->op == GGML_OP_MUL_MAT_ID;
     // The down result of an expert is written to next before the up/gate data of the remaining experts is read.
     // If the up/gate experts are copies of host tensors, next may have been allocated on top of them.
     for (int j = 0; fuse_down && j < GGML_MAX_SRC; ++j) {
@@ -3889,6 +3912,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 ggml_cuda_op_mul(ctx, dst);
             }
             break;
+        case GGML_OP_FMA:
+            ggml_cuda_op_fma(ctx, dst);
+            break;
         case GGML_OP_FUSED_MUL_UNARY:
             ggml_cuda_op_fused_mul_unary(ctx, dst);
             break;
@@ -4137,13 +4163,24 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_up_gate_unary(ctx, dst);
             break;
         case GGML_OP_SCALE:
-            if (fusion && i + 2 < cgraph->n_nodes &&
+            if (fusion && i + 4 < cgraph->n_nodes &&
                 cgraph->nodes[i+1]->op == GGML_OP_UNARY &&
                 cgraph->nodes[i+2]->op == GGML_OP_SCALE &&
                 cgraph->nodes[i+1]->src[0] == cgraph->nodes[i+0] &&
                 cgraph->nodes[i+2]->src[0] == cgraph->nodes[i+1] &&
-                (ggml_unary_op)cgraph->nodes[i+1]->op_params[0] == GGML_UNARY_OP_SOFTPLUS) {
-                ggml_cuda_op_scaled_softplus(ctx, cgraph->nodes[i+2]);
+                cgraph->nodes[i+3]->op == GGML_OP_RESHAPE &&
+                cgraph->nodes[i+4]->op == GGML_OP_FMA &&
+                cgraph->nodes[i+3]->src[0] == cgraph->nodes[i+2] &&
+                cgraph->nodes[i+4]->src[2] == cgraph->nodes[i+3] &&
+                ggml_cuda_op_fma_sus(ctx, cgraph->nodes[i+4])) {
+                i += 4;
+            }
+            else if (fusion && i + 2 < cgraph->n_nodes &&
+                cgraph->nodes[i+1]->op == GGML_OP_UNARY &&
+                cgraph->nodes[i+2]->op == GGML_OP_SCALE &&
+                cgraph->nodes[i+1]->src[0] == cgraph->nodes[i+0] &&
+                cgraph->nodes[i+2]->src[0] == cgraph->nodes[i+1] &&
+                ggml_cuda_op_scale_unary_scale(ctx, cgraph->nodes[i+2])) {
                 i += 2;
             }
             else if (fusion && i + 1 < cgraph->n_nodes &&
@@ -4635,6 +4672,12 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
                     if (next->op == GGML_OP_MUL_MAT_ID && ggml_is_quantized(next->src[0]->type)) {
                         ++i;
                     }
+                    else if (next->op == GGML_OP_HADAMARD && i < cgraph->n_nodes-2) {
+                        next = cgraph->nodes[i+2];
+                        if (next->op == GGML_OP_MUL_MAT_ID && ggml_is_quantized(next->src[0]->type)) {
+                            i += 2;
+                        }
+                    }
                 }
             }
         }
@@ -5054,6 +5097,12 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_IQ3_KS_R16:
                     case GGML_TYPE_IQ4_KS_R16:
                     case GGML_TYPE_IQ5_KS_R16:
+                    case GGML_TYPE_TQ2_T:
+                    case GGML_TYPE_TQK6:
+                    case GGML_TYPE_TQK7:
+                    case GGML_TYPE_TQP5:
+                    case GGML_TYPE_TQP6:
+                    case GGML_TYPE_TQP7:
                         return true;
                     default:
                         return false;
@@ -5209,6 +5258,7 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         case GGML_OP_MULTI_ADD:
         case GGML_OP_MUL_MULTI_ADD:
         case GGML_OP_MUL:
+        case GGML_OP_FMA:
         case GGML_OP_DIV:
         case GGML_OP_SUB:
         case GGML_OP_FUSED_RMS_NORM:

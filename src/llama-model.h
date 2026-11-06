@@ -523,6 +523,10 @@ struct llama_hadamard_transform {
     int64_t perm_hd  = 1;                 // GDN v-grouped reshape (head dim)
     int64_t perm_nk  = 1;                 // GDN v-grouped reshape (n groups)
     int64_t perm_rep = 1;                 // GDN v-grouped reshape (repeat count)
+    bool operator==(const llama_hadamard_transform & other) const {
+        return block_size == other.block_size && perm_hd == other.perm_hd && perm_nk == other.perm_nk && perm_rep == other.perm_rep
+            && signs == other.signs;
+    }
 };
 
 struct llama_model {
@@ -614,6 +618,7 @@ struct llama_model {
     int n_gpu_layers;
 
     bool mtp; // use mtp if is supported by the Model
+    bool dsa = false; // load the MiniMax-M3 indexer
     bool swa_compress = false; // value the cache-size fit was computed with
     bool fit = false;
 
@@ -719,6 +724,7 @@ struct llama_model {
             || arch == LLM_ARCH_LAGUNA    || arch == LLM_ARCH_GEMMA4
             || arch == LLM_ARCH_MAPLE
             || arch == LLM_ARCH_SPARK2_5
+            || arch == LLM_ARCH_LFM3
             || arch == LLM_ARCH_MAPLE     || arch == LLM_ARCH_FLINT
             || supports_dflash_swa_compress() ;
     }

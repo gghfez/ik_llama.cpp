@@ -132,6 +132,8 @@ struct server_task {
     server_task_type type;
     json data;
 
+    bool metrics_memory = false;
+
     bool infill = false;
     bool embedding = false;
 

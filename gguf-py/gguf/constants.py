@@ -306,6 +306,7 @@ class MODEL_ARCH(IntEnum):
     LAGUNA       = auto()
     LFM2         = auto()
     LFM2MOE      = auto()
+    LFM3         = auto()
     MAPLE        = auto()
     SPARK2_5     = auto()
 
@@ -574,6 +575,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.LAGUNA:         "laguna",
     MODEL_ARCH.LFM2:           "lfm2",
     MODEL_ARCH.LFM2MOE:        "lfm2moe",
+    MODEL_ARCH.LFM3:           "lfm3",
     MODEL_ARCH.MAPLE:          "maple",
     MODEL_ARCH.SPARK2_5:       "spark2_5",
 }
@@ -1382,6 +1384,29 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP_EXP,
         MODEL_TENSOR.FFN_GATE_UP_EXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
+    ],
+    MODEL_ARCH.LFM3: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ROPE_FREQS,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_POST_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.SHORTCONV_CONV,
+        MODEL_TENSOR.SHORTCONV_INPROJ,
+        MODEL_TENSOR.SHORTCONV_OUTPROJ,
     ],
     MODEL_ARCH.MAPLE: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -2288,6 +2313,12 @@ class GGMLQuantizationType(IntEnum):
     PTQ1_0    = 143
     PQ2_0_R8  = 160
     PTQ1_0_R8 = 161
+    TQK6      = 162
+    TQK7      = 163
+    TQ2_T     = 164
+    TQP5      = 165
+    TQP6      = 166
+    TQP7      = 167
     IQ4_KS    = 144
     IQ2_KS    = 145
     IQ4_KSS   = 146
@@ -2405,6 +2436,12 @@ class LlamaFileType(IntEnum):
     MOSTLY_IQ1_KT        = 156 #except 1d tensors
     MOSTLY_PQ2_0         = 157 #except 1d tensors  (Prism ternary, group-128)
     MOSTLY_PTQ1_0        = 158 #except 1d tensors  (Prism ternary, base-3)
+    MOSTLY_TQK6          = 163 #except 1d tensors  (trellis, group-128)
+    MOSTLY_TQK7          = 164 #except 1d tensors  (trellis, group-128)
+    MOSTLY_TQ2_T         = 165 #except 1d tensors  (trellis, group-128)
+    MOSTLY_TQP5          = 166 #except 1d tensors  (trellis, group-128)
+    MOSTLY_TQP6          = 167 #except 1d tensors  (trellis, group-128)
+    MOSTLY_TQP7          = 168 #except 1d tensors  (trellis, group-128)
 
     MOSTLY_Q4_0_R8       = 202 #except 1d tensors
     MOSTLY_Q8_0_R8       = 207 #except 1d tensors
@@ -2533,6 +2570,12 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.PTQ1_0      : ( 128,   28),
     GGMLQuantizationType.PQ2_0_R8    : ( 128,   34),
     GGMLQuantizationType.PTQ1_0_R8   : ( 128,   28),
+    GGMLQuantizationType.TQK6        : ( 128,   26),
+    GGMLQuantizationType.TQK7        : ( 128,   30),
+    GGMLQuantizationType.TQ2_T       : ( 128,   34),
+    GGMLQuantizationType.TQP5        : ( 128,   42),
+    GGMLQuantizationType.TQP6        : ( 128,   50),
+    GGMLQuantizationType.TQP7        : ( 128,   58),
     GGMLQuantizationType.IQ4_KS      : ( 256,  136),
     GGMLQuantizationType.IQ2_KS      : ( 256,   70),
     GGMLQuantizationType.IQ4_KSS     : ( 256,  128),
