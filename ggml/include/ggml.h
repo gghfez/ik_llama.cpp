@@ -425,6 +425,7 @@ extern "C" {
         GGML_TYPE_Q4_0_8_8  = 33,
         GGML_TYPE_I2_S      = 36,  // So we are able to consume MS BitNet I2_S quants
         GGML_TYPE_MXFP4     = 39,  // so we are compatible with mainline
+        GGML_TYPE_NVFP4     = 40,
         GGML_TYPE_Q1_0_G128 = 41,  // Bonsai 1-bit quants
         GGML_TYPE_Q2_0      = 42,  // same type id as mainline GGML_TYPE_Q2_0
         //
@@ -464,6 +465,14 @@ extern "C" {
         GGML_TYPE_PQ2_0_R8   = 160, // 8-row repacked PQ2_0 (Prism ternary)
         GGML_TYPE_PTQ1_0_R8  = 161, // 8-row repacked PTQ1_0 (Prism ternary, base-3)
 
+        GGML_TYPE_TQK6       = 162, // trellis-coded K=6, group 128 (Agention; on-disk id 145, remapped at load)
+        GGML_TYPE_TQK7       = 163, // trellis-coded K=7, group 128 (Agention; on-disk id 146, remapped at load)
+        GGML_TYPE_TQ2_T      = 164, // trellis-coded 2.125 bpw (Agention; on-disk id 144, remapped at load)
+        GGML_TYPE_TQP5       = 165, // pair trellis K=5, group 128 (Agention; on-disk id 147, remapped at load)
+        GGML_TYPE_TQP6       = 166, // pair trellis K=6, group 128 (Agention; on-disk id 148, remapped at load)
+        GGML_TYPE_TQP7       = 167, // pair trellis K=7, group 128 (Agention; on-disk id 149, remapped at load)
+        GGML_TYPE_NVFP4_KS   = 168,
+
         GGML_TYPE_Q4_0_R8    = 202,
         GGML_TYPE_Q5_0_R4    = 206,
         GGML_TYPE_Q8_0_R8    = 208,
@@ -494,6 +503,7 @@ extern "C" {
         GGML_TYPE_IQ5_KS_R16 = 347,
         GGML_TYPE_IQ5_KS_R4  = 352,
         GGML_TYPE_MXFP4_R8   = 353,
+        GGML_TYPE_Q2_0_R8    = 354, // 8-row repacked Q2_0
         GGML_TYPE_Q8_0_R16   = 396,
         GGML_TYPE_Q8_K_R16   = 397,
         GGML_TYPE_Q8_KV_R8   = 398,
@@ -568,6 +578,13 @@ extern "C" {
         GGML_FTYPE_MOSTLY_IQ1_KT  = 147, // except 1d tensors
         GGML_FTYPE_MOSTLY_PQ2_0   = 148, // except 1d tensors (Prism ternary)
         GGML_FTYPE_MOSTLY_PTQ1_0  = 149, // except 1d tensors (Prism ternary)
+        GGML_FTYPE_MOSTLY_TQK6    = 150, // except 1d tensors (trellis, group-128)
+        GGML_FTYPE_MOSTLY_TQK7    = 151, // except 1d tensors (trellis, group-128)
+        GGML_FTYPE_MOSTLY_TQ2_T   = 152, // except 1d tensors (trellis, group-128)
+        GGML_FTYPE_MOSTLY_TQP5    = 153, // except 1d tensors (trellis, group-128)
+        GGML_FTYPE_MOSTLY_TQP6    = 154, // except 1d tensors (trellis, group-128)
+        GGML_FTYPE_MOSTLY_TQP7    = 155, // except 1d tensors (trellis, group-128)
+        GGML_FTYPE_MOSTLY_NVFP4_KS = 156,
                                          //
         GGML_FTYPE_MOSTLY_Q4_0_R8   = 202, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q8_0_R8   = 207, // except 1d tensors
@@ -599,6 +616,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_IQ5_KS_R16= 340, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ5_KS_R4 = 341, // except 1d tensors
         GGML_FTYPE_MOSTLY_MXFP4_R8  = 342, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q2_0_R8   = 343, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q8_K_R16  = 397, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q8_KV_R8  = 398, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q8_K_R8   = 399, // except 1d tensors
@@ -729,6 +747,8 @@ extern "C" {
         GGML_OP_MASK_TO_IDX,
         GGML_OP_LATENT_ATTN,
         GGML_OP_DS4_COMP,
+
+        GGML_OP_FMA,
 
         GGML_OP_COUNT,
     };
@@ -951,6 +971,10 @@ extern "C" {
     GGML_API void    ggml_print_object (const struct ggml_object * obj);
     GGML_API void    ggml_print_objects(const struct ggml_context * ctx);
 
+    GGML_API void ggml_set_input_scale(struct ggml_tensor * tensor, float scale);
+    GGML_API float ggml_get_input_scale(const struct ggml_tensor * tensor);
+    GGML_API bool  ggml_mxfp4_to_nvfp4_ks(const void * src, void * dst, int n_per_row);
+
     GGML_API GGML_CALL int64_t ggml_nelements   (const struct ggml_tensor * tensor);
     GGML_API GGML_CALL int64_t ggml_nrows       (const struct ggml_tensor * tensor);
     GGML_API GGML_CALL size_t  ggml_nbytes      (const struct ggml_tensor * tensor);
@@ -1163,6 +1187,12 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   n);
+
+    GGML_API struct ggml_tensor * ggml_signed_hadamard(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * signs,
+            int                   n, int before);
 
     // dst = a
     // view(dst, nb1, nb2, nb3, offset) += b
@@ -1444,6 +1474,20 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 alpha,
             float                 limit);
+
+    // c + a*b. a and b must be broadcastable to c
+    GGML_API struct ggml_tensor * ggml_fma(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    // c += a*b. a and b must be broadcastable to c
+    GGML_API struct ggml_tensor * ggml_fma_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
 
     //
     // *** from mainline begin ***
@@ -2709,7 +2753,10 @@ extern "C" {
             struct ggml_tensor  * mask,
             struct ggml_tensor  * blk_idx,
             enum ggml_unary_op    op,
-            int                   n_top_k);
+            int                   n_top_k,
+            int                   group_size,
+            bool                  select_groups,
+            struct ggml_tensor  * top_k_out);
 
     // Sinkhorn normalization of a flat [S*S, T] batch of S x S matrices into
     // doubly-stochastic form: softmax over columns, then column normalization,
@@ -2734,7 +2781,8 @@ extern "C" {
             struct ggml_tensor  * bias,
             int                   S,
             int                   n_iters,
-            float                 eps);
+            float                 eps,
+            float                 clamp);
 
     GGML_API struct ggml_tensor * ggml_hc_post(
             struct ggml_context * ctx,
@@ -2754,6 +2802,13 @@ extern "C" {
             struct ggml_tensor  * mask,
             struct ggml_tensor  * topk,
             struct ggml_tensor  * n_visible,
+            int                   max_row_size);
+
+    // ggml_mask_to_index(ggml_indexer_mask(mask, topk), max_row_size) without the dense mask
+    GGML_API struct ggml_tensor * ggml_indexer_mask_to_index(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * topk,
             int                   max_row_size);
 
     GGML_API struct ggml_tensor * ggml_ds4_comp(

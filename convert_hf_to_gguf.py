@@ -7386,6 +7386,52 @@ class LFM2Model(Model):
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
 
+@Model.register("Lfm3ForCausalLM", "LFM3ForCausalLM")
+class LFM3Model(LFM2Model):
+    """Converter for Liquid AI's dense LFM3 models."""
+
+    model_arch = gguf.MODEL_ARCH.LFM3
+
+    def _rope_param_for(self, layer_type: str) -> dict:
+        rope_parameters = self.hparams.get("rope_parameters")
+        if isinstance(rope_parameters, dict):
+            params = rope_parameters.get(layer_type)
+            if isinstance(params, dict):
+                return params
+            if "rope_theta" in rope_parameters:
+                return rope_parameters
+        return {}
+
+    def _set_rope_theta(self):
+        if self.hparams.get("rope_theta") is None:
+            rope_theta = self._rope_param_for("full_attention").get("rope_theta")
+            if rope_theta is not None:
+                self.hparams["rope_theta"] = rope_theta
+
+    def set_gguf_parameters(self):
+        self.hparams.setdefault("norm_eps", self.hparams.get("rms_norm_eps"))
+        super().set_gguf_parameters()
+
+        layer_types = self.hparams["layer_types"]
+        self.gguf_writer.add_sliding_window(int(self.hparams["sliding_window"]))
+        self.gguf_writer.add_sliding_window_pattern(
+            [layer_type == "sliding_attention" for layer_type in layer_types])
+
+        rope_theta_swa = self._rope_param_for("sliding_attention").get("rope_theta")
+        if rope_theta_swa is not None:
+            self.gguf_writer.add_rope_freq_base_swa(float(rope_theta_swa))
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        head_dim = self._head_dim()
+        partial_rotary_factor = float(
+            self._rope_param_for("full_attention").get("partial_rotary_factor", 1.0))
+        rope_angles = int(head_dim * partial_rotary_factor) // 2
+        n_pairs = head_dim // 2
+        values = [1.0] * rope_angles + [1e30] * (n_pairs - rope_angles)
+        yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS),
+               torch.tensor(values, dtype=torch.float32))
+
+
 @Model.register("Lfm2MoeForCausalLM", "LFM2MoeForCausalLM")
 class LFM2MoeModel(LFM2Model):
     """Converter for Liquid AI's LFM2 MoE models (LFM2-8B-A1B, LFM2-24B-A2B, ...)."""
@@ -7623,6 +7669,71 @@ def split_str_to_n_bytes(split_str: str) -> int:
 
     return n
 
+
+@Model.register("Xing4_0ForCausalLM")
+@Model.register("XingChen4ForCausalLM")
+class Xing4Model(DeepseekV2Model):
+    model_arch = gguf.MODEL_ARCH.XING4_0
+
+    def set_vocab(self):
+        from sentencepiece import SentencePieceProcessor
+        tokenizer_path = self.dir_model / "tokenizer.model"
+        if not tokenizer_path.is_file():
+            raise FileNotFoundError(f"Missing tokenizer.model in {self.dir_model}")
+        tokenizer = SentencePieceProcessor()
+        tokenizer.LoadFromFile(str(tokenizer_path))
+        tokens: list[bytes] = []
+        scores: list[float] = []
+        toktypes: list[int] = []
+        for i in range(tokenizer.vocab_size()):
+            if tokenizer.is_unknown(i):
+                text = " \u2047 ".encode()
+            elif tokenizer.is_control(i):
+                text = b""
+            elif tokenizer.is_byte(i):
+                piece = tokenizer.id_to_piece(i)
+                if len(piece) != 6 or piece[0] != "<" or piece[-1] != ">":
+                    raise ValueError(f"Invalid byte piece {piece}")
+                text = bytes([int(piece[1:-1], 16)])
+            else:
+                text = tokenizer.id_to_piece(i).replace("\u2581", " ").encode()
+            tokens.append(text)
+            scores.append(tokenizer.get_score(i))
+            toktypes.append(tokenizer.get_type(i))
+        self.gguf_writer.add_tokenizer_model("llama")
+        self.gguf_writer.add_tokenizer_pre("default")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_scores(scores)
+        self.gguf_writer.add_token_types(toktypes)
+        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_writer)
+        self.gguf_writer.add_add_bos_token(True)
+        self.gguf_writer.add_add_eos_token(True)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_hyper_connection_count(self.hparams["hc_mult"])
+        self.gguf_writer.add_hyper_connection_sinkhorn_iterations(self.hparams.get("hc_sinkhorn_iters", 20))
+        self.gguf_writer.add_hyper_connection_epsilon(self.hparams.get("hc_eps", 1e-6))
+        self.gguf_writer.add_hyper_connection_magnitude(self.hparams.get("hc_magnitude", 2.0))
+
+    def modify_tensors(self, data_torch, name, bid):
+        m = re.match(r"model\.layers\.(\d+)\.(attn_hc|ffn_hc)\.(hc_fn|hc_base|hc_scale)$", name)
+        if m:
+            il = int(m.group(1))
+            if il >= int(self.hparams["num_hidden_layers"]):
+                return
+            site = "ATTN" if m.group(2) == "attn_hc" else "FFN"
+            leaf = {"hc_fn": "FN", "hc_base": "BASE", "hc_scale": "SCALE"}[m.group(3)]
+            yield self.format_tensor_name(getattr(gguf.MODEL_TENSOR, f"HC_{site}_{leaf}"), il), data_torch
+            return
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        import re
+        if ".hc_" in new_name and not new_name.endswith("_fn.weight"):
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
 
 @Model.register("Raon1MiniForCausalLM")
 class Raon1Model(Model):
