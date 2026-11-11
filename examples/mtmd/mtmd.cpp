@@ -907,7 +907,13 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
 
 bool mtmd_decode_use_non_causal(mtmd_context * ctx) {
     if (ctx->ctx_v) {
-        if (auto type = clip_get_projector_type(ctx->ctx_v); type == PROJECTOR_TYPE_GEMMA3 || type == PROJECTOR_TYPE_GEMMA4V || type == PROJECTOR_TYPE_GEMMA4UV || type == PROJECTOR_TYPE_DEEPSEEK4V) {
+        auto type = clip_get_projector_type(ctx->ctx_v);
+        if (type == PROJECTOR_TYPE_GEMMA4V) {
+            // E2B (1536) and E4B (2560) have use_bidirectional_attention = null -> causal
+            const int n_embd = clip_n_mmproj_embd(ctx->ctx_v);
+            return n_embd != 1536 && n_embd != 2560;
+        }
+        if (type == PROJECTOR_TYPE_GEMMA3 || type == PROJECTOR_TYPE_GEMMA4UV || type == PROJECTOR_TYPE_DEEPSEEK4V) {
             return true;
         }
     }
