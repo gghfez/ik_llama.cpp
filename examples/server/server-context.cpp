@@ -3013,6 +3013,7 @@ void server_context::jlens_media_begin(server_slot& slot, llama_pos pos) {
         }
     }
     jlens_cap.want = want;
+    llama_set_keep_all_rows(ctx, want);
 }
 
 void server_context::jlens_media_batch_done(server_slot& slot, const llama_batch& batch,
@@ -5382,6 +5383,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             ctx, mctx, slot.n_past_prompt, p1, slot.id, n_tokens_out,
                             server_media_decode_callback, &media_hook);
                     jlens_cap.begin_decode(false, 0);
+                    llama_set_keep_all_rows(ctx, false);
                     if (res != 0) {
                         LLAMA_LOG_ERROR("failed to process image, res = %d\n", res);
                         slot.release();
@@ -6036,6 +6038,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             }
         }
         jlens_cap.want = jlens_want;
+        llama_set_keep_all_rows(ctx, jlens_want);
 
         // token index -> output-row index (differs once non-output rows are pruned)
         auto batch_out_index = [&](int32_t tok) -> int32_t {

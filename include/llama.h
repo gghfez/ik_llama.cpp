@@ -888,6 +888,11 @@ extern "C" {
     // model's own unembedding so the result is comparable to the model's real logits.
     struct llama_jlens;
 
+    // Keep every token row through the whole graph, even when only some rows are outputs.
+    // Some graphs (e.g. gemma4's KV-shared tail) otherwise drop non-output rows part-way
+    // through, so an eval callback reading per-token residuals (jlens) would see fewer rows.
+    LLAMA_API void llama_set_keep_all_rows(struct llama_context * ctx, bool keep_all_rows);
+
     // Any value >= 0 is a backend device index
     enum llama_jlens_device {
         LLAMA_JLENS_DEVICE_AUTO = -2, // same backend buffer type as the model's output (lm_head)

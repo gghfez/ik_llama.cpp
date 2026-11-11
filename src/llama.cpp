@@ -608,6 +608,7 @@ struct llama_context::Prev {
     uint64_t seq_fingerprint;
     uint64_t model_state_hash;
     ggml_cgraph * graph;
+    bool keep_all_rows;
 };
 
 static inline bool llama_graph_bakes_seq_state(const llm_arch & arch) {
@@ -730,6 +731,7 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fi
            cparams.mtp_op_type == the_prev->mtp_op_type &&
            mtp_step_idx == the_prev->mtp_step_idx &&
            mtp_n_heads == the_prev->mtp_n_heads &&
+           keep_all_rows == the_prev->keep_all_rows &&
            update_cache_copies();
     if (false && !result) {
         printf("%s(%d):", __func__, cparams.mtp_op_type);
@@ -7828,7 +7830,7 @@ static int llama_decode_internal(
                         cparams.mtp_op_type, lctx.mtp_step_idx, lctx.mtp_n_heads,
                         lctx.swa_window_view.w_view,
                         lctx.swa_window_view.win_off,
-                        seq_fingerprint, state_hash, gf});
+                        seq_fingerprint, state_hash, gf, lctx.keep_all_rows});
             }
         } else {
             //printf("Reusing graph with type = %d, n_kv = %d, n_tokens = %d\n", cparams.mtp_op_type, (int)prev->n_kv, (int)prev->n_tokens);
@@ -14284,6 +14286,10 @@ void llama_set_mtp_step_idx(llama_context * ctx, int32_t mtp_step_idx) {
 
 void llama_set_mtp_n_heads(llama_context * ctx, int32_t mtp_n_heads) {
     ctx->set_mtp_n_heads(mtp_n_heads);
+}
+
+void llama_set_keep_all_rows(llama_context * ctx, bool keep_all_rows) {
+    ctx->keep_all_rows = keep_all_rows;
 }
 
 void llama_synchronize(struct llama_context * ctx) {

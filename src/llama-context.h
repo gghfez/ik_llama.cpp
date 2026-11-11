@@ -769,6 +769,8 @@ struct llama_context {
     std::unique_ptr<Prev> prev_mtp;
     int32_t mtp_step_idx = 0;
     int32_t mtp_n_heads = 0;
+    // set by llama_set_keep_all_rows(): disables graph-level pruning of non-output rows
+    bool keep_all_rows = false;
 
     void reset_scheduler();
     bool can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fingerprint, uint64_t model_state_hash);

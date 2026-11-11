@@ -996,7 +996,8 @@ ggml_cgraph * llm_build_context::build_gemma4() {
     const int  n_layer_kv_from_start = hparams.n_layer_kv_from_start;
     const bool prune_shared = inp_out_ids && n_outputs < n_tokens &&
                               n_layer_kv_from_start > 0 && n_layer_kv_from_start < n_layer &&
-                              cparams.n_seq_max == 1 && !cparams.embeddings;
+                              cparams.n_seq_max == 1 && !cparams.embeddings &&
+                              !lctx.keep_all_rows; // jlens needs every token row at every layer
     int  n_rows = n_tokens;
     bool pruned = false;
 
