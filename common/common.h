@@ -550,7 +550,7 @@ struct gpt_params {
 
     // tool call and template
     std::string chat_template = "";
-    bool use_jinja = false;                                                                                 // NOLINT
+    bool use_jinja = true;                                                                                  // NOLINT
     bool use_peg = false;
     std::string system_prompt = "";
     bool enable_chat_template = true;

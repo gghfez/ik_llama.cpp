@@ -3055,6 +3055,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.use_jinja = true;
         return true;
     }
+    if (arg == "--no-jinja") {
+        params.use_jinja = false;
+        return true;
+    }
     if (arg == "--peg") {
         return true;
     }
@@ -3553,14 +3557,14 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "negative prompt file to use for guidance" });
     options.push_back({ "main",        "       --cfg-scale N",          "strength of guidance (default: %.1f, 1.0 = disable)", (double)sparams.cfg_scale });
     options.push_back({ "template" });
-    options.push_back({ "main",        "       --jinja",
+    options.push_back({ "main",        "       --jinja, --no-jinja",
+                                                                        "whether to use jinja template engine for chat (default: %s)", params.use_jinja ? "enabled" : "disabled" });
+    options.push_back({ "main",        "-ptcall, --parallel-tool-calls",  "enable parallel tool calls\n" });
+    options.push_back({ "main",        "       --chat-template JINJA_TEMPLATE",
                                                                         "set custom jinja chat template (default: template taken from model's metadata)\n"
                                                                         "if suffix/prefix are specified, template will be disabled\n"
                                                                         "only commonly used templates are accepted:\n"
                                                                         "https://github.com/ggerganov/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template" });
-    options.push_back({ "main",        "-ptcall, --parallel-tool-calls",  "enable parallel tool calls\n" });
-    options.push_back({ "main",        "       --chat-template JINJA_TEMPLATE",
-                                                                        "use jinja template for chat (default: disabled)\n" });
     options.push_back({ "main",        "       --chat-template-file file_with_JINJA_TEMPLATE",
                                                                         "load jinja template for chat from the file\n" });
     options.push_back({ "main",        "       --reasoning-format FORMAT",
