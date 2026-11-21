@@ -1156,6 +1156,7 @@ int main(int argc, char ** argv) {
                 {"vision", ctx_server.chat_params.allow_image},
                 {"audio",  ctx_server.chat_params.allow_audio},
             } },
+            { "media_marker",                get_media_marker() },
             { "n_ctx",                       ctx_server.n_ctx },
             { "cors_proxy_enabled",          ctx_server.params_base.webui_mcp_proxy},
 
