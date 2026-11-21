@@ -88,9 +88,6 @@ struct quantize_state_internal {
 
 std::pair<ggml_type, int> interleaved_properties(ggml_type type) {
     static std::unordered_map<ggml_type, std::pair<ggml_type, int>> k_map = {
-        { GGML_TYPE_Q4_0_4_4,    { GGML_TYPE_Q4_0, 4} },
-        { GGML_TYPE_Q4_0_4_8,    { GGML_TYPE_Q4_0, 4} },
-        { GGML_TYPE_Q4_0_8_8,    { GGML_TYPE_Q4_0, 8} },
         { GGML_TYPE_Q4_0_R8,     { GGML_TYPE_Q4_0, 8} },
         { GGML_TYPE_Q5_0_R4,     { GGML_TYPE_Q5_0, 4} },
         { GGML_TYPE_Q6_0_R4,     { GGML_TYPE_Q6_0, 4} },
@@ -365,11 +362,18 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
     const llm_arch arch = qs.model.arch;
 
     // Raon-1/Xing4.0: keep MLA latents at source precision for Q6_K/Q8_0.
-    if ((arch == LLM_ARCH_RAON1 || arch == LLM_ARCH_XING4_0) &&
+    if ((arch == LLM_ARCH_RAON1 || arch == LLM_ARCH_RAON1_NANO || arch == LLM_ARCH_XING4_0) &&
             (ftype == LLAMA_FTYPE_MOSTLY_Q6_K || ftype == LLAMA_FTYPE_MOSTLY_Q8_0) &&
             (name.find("attn_kv_a_mqa.weight") != std::string::npos ||
              name.find("attn_k_b.weight")      != std::string::npos ||
              name.find("attn_v_b.weight")      != std::string::npos)) {
+        return tensor->type;
+    }
+    // Raon-1 nano: keep hc_* and ssm_f_a/ssm_f_b at source precision.
+    if (arch == LLM_ARCH_RAON1_NANO &&
+            (name.find("hc_")            != std::string::npos ||
+             name.find("ssm_f_a.weight") != std::string::npos ||
+             name.find("ssm_f_b.weight") != std::string::npos)) {
         return tensor->type;
     }
     const auto       tn = LLM_TN(arch);
@@ -1446,9 +1450,6 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         case LLAMA_FTYPE_MOSTLY_IQ3_S:   default_type = GGML_TYPE_IQ3_S;   break;
         case LLAMA_FTYPE_MOSTLY_IQ3_S_R4:default_type = GGML_TYPE_IQ3_S_R4;break;
         case LLAMA_FTYPE_MOSTLY_IQ3_M:   default_type = GGML_TYPE_IQ3_S;   break;
-        case LLAMA_FTYPE_MOSTLY_Q4_0_4_4: default_type = GGML_TYPE_Q4_0_4_4; break;
-        case LLAMA_FTYPE_MOSTLY_Q4_0_4_8: default_type = GGML_TYPE_Q4_0_4_8; break;
-        case LLAMA_FTYPE_MOSTLY_Q4_0_8_8: default_type = GGML_TYPE_Q4_0_8_8; break;
 
         default: throw std::runtime_error(format("invalid output file type %d\n", ftype));
     }
@@ -1503,7 +1504,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     struct quantize_state_internal qs(model, params);
 
     if (params->only_copy) {
-        ftype = model.ftype;
+        ftype = model.ftype == LLAMA_FTYPE_MOSTLY_F8_E4M3 ? LLAMA_FTYPE_MOSTLY_F8_E4M3_KS : model.ftype;
     }
     const std::unordered_map<std::string, std::vector<float>> * imatrix_data = nullptr;
     if (!params->only_repack && the_imatrix) {
@@ -1670,6 +1671,9 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     if (!output_meta) {
         output_meta = ml.get_tensor_meta("token_embd.weight");
     }
+    if (params->extra_output_type == GGML_TYPE_F8_E4M3 || params->extra_output_type == GGML_TYPE_F8_E4M3_KS || params->extra_output_type == GGML_TYPE_F8_E4M3_B128) {
+        throw std::runtime_error("F8 types are not quantization targets; use COPY to repack type 43");
+    }
     ggml_tensor * output_tensor = nullptr;
     if (params->extra_output_type != GGML_TYPE_COUNT) {
         auto meta = ml.get_tensor_meta("output.weight");
@@ -1834,7 +1838,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         return std::make_pair(quantize, new_type);
     };
 
-    // decide every tensor before the header is written; an NVFP4_KS weight written unchanged keeps its input scale
+    // decide every tensor before the header is written; an NVFP4_KS or FP8 weight written unchanged keeps its input scale
     struct tensor_plan {
         bool quantize = false;
         ggml_type new_type = GGML_TYPE_COUNT;
@@ -1844,7 +1848,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     for (int i = 0; !params->only_repack && i < ml.n_tensors; ++i) {
         ggml_tensor * tensor = ml.get_weight(i)->tensor;
         std::tie(plan[i].quantize, plan[i].new_type) = get_new_type(qs, tensor);
-        if (plan[i].quantize || tensor->type != GGML_TYPE_NVFP4_KS || params->partial_requant) continue;
+        const bool keeps = tensor->type == GGML_TYPE_NVFP4_KS || tensor->type == GGML_TYPE_F8_E4M3_KS || tensor->type == GGML_TYPE_F8_E4M3_B128;
+        if (plan[i].quantize || !keeps || params->partial_requant) continue;
         const std::string name = ggml_get_name(tensor);
         const std::string is_name = name.substr(0, name.rfind('.')) + ".input_scale";
         for (const auto & w : ml.scale_weights) if (is_name == ggml_get_name(w.tensor)) plan[i].input_scale = &w;
@@ -2065,6 +2070,10 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 chunk_size_multiplier = num_rows;
             }
 
+            if (new_type == GGML_TYPE_F8_E4M3 || new_type == GGML_TYPE_F8_E4M3_KS || new_type == GGML_TYPE_F8_E4M3_B128) {
+                throw std::runtime_error("F8 types are not quantization targets; use COPY to repack type 43");
+            }
+
             LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
             fflush(stdout);
 
@@ -2276,6 +2285,12 @@ static void estimate_imatrix_internal(const std::string & fname_inp,
 
         std::string name = ggml_get_name(tensor);
 
+        if (is_repack_forbidden(name)) {
+            // We do not want to spend time estimating an imatrix for token embeddings,
+            // per layer embeddings, engrams, etc.
+            continue;
+        }
+
         if (!ml.use_mmap) {
             if (read_data.size() < ggml_nbytes(tensor)) {
                 read_data.resize(ggml_nbytes(tensor));
@@ -2433,23 +2448,55 @@ static void estimate_imatrix_internal(const std::string & fname_inp,
         }
         return false;
     };
+
     for (auto & [name, sums] : sum_map) {
         auto & values = new_imatrix[name];
         values = sums.sum_c;
         auto imatrix = find_imatrix_data(name, values.size(), imatrix_data);
-        bool check_ffn = true;
+        bool check = true;
         // It looks like for dense FFN it is better to not fully couple the impartance
-        check_ffn = check_ffn && !check_up_gate(name, values, "ffn_up.weight", "ffn_gate.weight");
-        check_ffn = check_ffn && !check_up_gate(name, values, "ffn_gate.weight", "ffn_up.weight");
-        //check_ffn = check_ffn && !check_ugd (name, values, "ffn_up.weight", "ffn_gate.weight", "ffn_down.weight");
-        //check_ffn = check_ffn && !check_ugd (name, values, "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight");
-        check_ffn = check_ffn && !check_down(name, values, "ffn_down.weight", "ffn_up.weight", "ffn_gate.weight");
-        //check_ffn = check_ffn && !check_up_gate(name, values, "ffn_up_exps.weight", "ffn_gate_exps.weight");
-        //check_ffn = check_ffn && !check_up_gate(name, values, "ffn_gate_exps.weight", "ffn_up_exps.weight");
+        check = check && !check_up_gate(name, values, "ffn_up.weight", "ffn_gate.weight");
+        check = check && !check_up_gate(name, values, "ffn_gate.weight", "ffn_up.weight");
+        //check = check && !check_ugd (name, values, "ffn_up.weight", "ffn_gate.weight", "ffn_down.weight");
+        //check = check && !check_ugd (name, values, "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight");
+        check = check && !check_down(name, values, "ffn_down.weight", "ffn_up.weight", "ffn_gate.weight");
+
         // It looks like for MoE FFN it is better to fully couple the impartance
-        check_ffn = check_ffn && !check_ugd (name, values, "ffn_up_exps.weight", "ffn_gate_exps.weight", "ffn_down_exps.weight");
-        check_ffn = check_ffn && !check_ugd (name, values, "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight");
-        check_ffn = check_ffn && !check_down(name, values, "ffn_down_exps.weight", "ffn_up_exps.weight", "ffn_gate_exps.weight");
+        //check = check && !check_up_gate(name, values, "ffn_up_exps.weight", "ffn_gate_exps.weight");
+        //check = check && !check_up_gate(name, values, "ffn_gate_exps.weight", "ffn_up_exps.weight");
+        check = check && !check_ugd (name, values, "ffn_up_exps.weight", "ffn_gate_exps.weight", "ffn_down_exps.weight");
+        check = check && !check_ugd (name, values, "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight");
+        check = check && !check_down(name, values, "ffn_down_exps.weight", "ffn_up_exps.weight", "ffn_gate_exps.weight");
+
+        check = check && !check_up_gate(name, values, "attn_k.weight", "attn_q.weight");
+        check = check && !check_up_gate(name, values, "attn_q.weight", "attn_k.weight");
+
+        if (auto pos = name.find(".attn_v.weight"); pos != std::string::npos) {
+            check = false;
+            auto other_name_k = name.substr(0, pos) + ".attn_k.weight";
+            auto other_name_q = name.substr(0, pos) + ".attn_q.weight";
+            if (auto itk = sum_map.find(other_name_k), itq = sum_map.find(other_name_q); itk != sum_map.end() && itq != sum_map.end()) {
+                LLAMA_LOG_INFO("Combining %s and %s, %s\n", name.c_str(), other_name_k.c_str(), other_name_q.c_str());
+                if (values.size() == itk->second.sum_c.size()) {
+                    for (int j = 0; j < int(values.size()); ++j) values[j] *= itk->second.sum_c[j];
+                }
+                if (values.size() == itq->second.sum_c.size()) {
+                    for (int j = 0; j < int(values.size()); ++j) values[j] *= itq->second.sum_c[j];
+                }
+            }
+        }
+
+        if (auto pos = name.find(".ssm_out.weight"); pos != std::string::npos) {
+            check = false;
+            if (!imatrix) {
+                auto other_name = name.substr(0, pos) + ".attn_qkv.weight";
+                if (auto it = sum_map.find(other_name); it != sum_map.end() && values.size() <= it->second.sum_r.size()) {
+                    LLAMA_LOG_INFO("Combining %s and %s\n", name.c_str(), other_name.c_str());
+                    for (int j = 0; j < int(values.size()); ++j) values[j] *= (2.0f + it->second.sum_r[j]);
+                }
+            }
+        }
+
         if (imatrix) {
             double sum1 = 0, sum2 = 0;
             for (int j = 0; j < int(values.size()); ++j) sum1 += (double)imatrix[j];

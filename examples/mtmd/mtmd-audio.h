@@ -38,6 +38,12 @@ bool preprocess_audio(
         const whisper_filters & filters,
         std::vector<whisper_mel> & output);
 
+// raw-waveform framing (e.g. gemma4ua), stored mel-major
+whisper_mel preprocess_audio_raw_frames(
+        const float * samples,
+        size_t n_samples,
+        int frame_size);
+
 } // namespace whisper_preprocessor
 
 // MiMo-V2.5 / V2.6 audio tokenizer front-end: 24 kHz, HTK log-mel (natural log, magnitude),
@@ -57,19 +63,6 @@ bool preprocess_audio(
         std::vector<whisper_preprocessor::whisper_mel> & output);
 
 } // namespace mimo_audio_preprocessor
-
-// Gemma 4 unified (encoder-free) audio: 16 kHz raw waveform cut into frames of frame_size samples,
-// the last one zero-padded; each frame is one token. Output is "mel-major" like the whisper mel
-// (data[f * n_len + t]) with n_mel = frame_size, so it follows the [n_len, n_mel] input convention.
-namespace gemma4ua_preprocessor {
-
-bool preprocess_audio(
-        const float * samples,
-        size_t n_samples,
-        int frame_size,
-        std::vector<whisper_preprocessor::whisper_mel> & output);
-
-} // namespace gemma4ua_preprocessor
 
 namespace whisper_precalc_filters {
 

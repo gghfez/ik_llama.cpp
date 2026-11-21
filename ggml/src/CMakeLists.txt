@@ -403,7 +403,7 @@ if (GGML_CUDA)
                 set(GGML_EXTRA_INCLUDES ${GGML_EXTRA_INCLUDES} ${NCCL_INCLUDE_DIRS})
                 add_compile_definitions(GGML_USE_NCCL)
             else()
-                message("==================== NCCL NOT found -> building wihout NCCL support")
+                message("==================== NCCL NOT found -> building without NCCL support")
             endif()
         endif()
 
@@ -716,7 +716,7 @@ if (GGML_VULKAN)
         list(APPEND GGML_CDEF_PUBLIC GGML_USE_VULKAN)
 
         # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
-        # Posssibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
+        # Possibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
         if (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
             add_compile_definitions(_ITERATOR_DEBUG_LEVEL=0)
         endif()
@@ -1390,7 +1390,6 @@ add_library(ggml
             ${GGML_SOURCES_IQK_MM}    ${GGML_HEADERS_IQK_MM}
             ${GGML_SOURCES_IQK}       ${GGML_HEADERS_IQK}
             ${GGML_SOURCES_CANN}      ${GGML_HEADERS_CANN}
-            ggml-aarch64.c            ggml-aarch64.h
             )
 
 if (EMSCRIPTEN)

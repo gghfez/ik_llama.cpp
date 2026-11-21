@@ -50,6 +50,10 @@ GGML_API GGML_CALL size_t ggml_cuda_quantize(int device, enum ggml_type type, co
 
 // Enable/disable CUDA graph capture for a backend (returns previous state) to avoid cuBLAS memory leaks with dynamic shapes.
 GGML_API GGML_CALL bool ggml_backend_cuda_set_use_graphs(ggml_backend_t backend, bool use);
+
+GGML_CALL bool ggml_backend_cuda_copy_all_inputs_to_cpu(ggml_backend_sched_t sched, ggml_backend_t backend, int n_inputs,
+        ggml_tensor ** inputs, ggml_tensor ** input_copies, const ggml_tensor * node0, bool has_lru_cache);
+
 #ifdef  __cplusplus
 }
 #endif

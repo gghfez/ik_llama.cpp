@@ -344,6 +344,10 @@ struct llm_build_context {
 
     ggml_cgraph * build_mamba();
 
+    ggml_cgraph * build_nemotron_h();
+
+    ggml_tensor * build_nemotron_mamba2(ggml_cgraph * gf, ggml_tensor * cur, ggml_tensor * ssm_ids, int il);
+
     ggml_cgraph * build_command_r();
 
     ggml_cgraph * build_olmo();
@@ -414,6 +418,14 @@ struct llm_build_context {
         int64_t n_stream,
         float norm_rms_eps,
         bool force_contiguous);
+
+    // Per-layer (PLE) input projection, shared with Gemma4. eps_scale scales the RMS eps.
+    ggml_tensor * build_per_layer_inputs(
+        ggml_tensor * inputs_embeds,
+        ggml_tensor * inp_per_layer,
+        int64_t n_embd_per_layer,
+        int64_t n_layer,
+        float eps_scale);
 
     ggml_tensor * build_deepseek2_tp_attention(
             ggml_cgraph * gf, int il,
@@ -490,6 +502,8 @@ struct llm_build_context {
     ggml_cgraph * build_bailingmoe3();
     ggml_cgraph * build_glm5next();
     ggml_cgraph * build_raon1();
+    ggml_cgraph * build_raon1nano();
+    ggml_cgraph * build_raon1nano_mtp();
     ggml_cgraph * build_xing4();
 
     ggml_cgraph * build_glm5next_mtp();
@@ -508,6 +522,8 @@ struct llm_build_context {
     ggml_cgraph * build_seedoss();
 
     ggml_cgraph * build_laguna();
+
+    ggml_cgraph * build_step5();
 
     ggml_cgraph * build_step35();
 
