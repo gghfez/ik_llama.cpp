@@ -11155,8 +11155,21 @@ struct llama_jlens {
     std::vector<uint8_t> buf_compute;
     std::vector<uint8_t> buf_vectors;
     std::vector<uint8_t> buf_batch;
+    std::vector<uint8_t> buf_topk;
+
+    // Token mask for llama_jlens_topk, kept on the lm_head's device: [n_vocab, mask_cap] F32 of 0 / -inf,
+    // one row per requested layer. Re-uploaded only when the (layers, ids) set changes.
+    ggml_context *        mask_ctx  = nullptr;
+    ggml_backend_buffer_t mask_buf  = nullptr;
+    struct ggml_tensor *  mask      = nullptr;
+    int64_t               mask_cap  = 0;
+    uint64_t              mask_hash = 0;
+    bool                  mask_any  = false;
+    std::vector<int32_t>  mask_n_masked; // distinct masked ids per row
 
     ~llama_jlens() {
+        if (mask_buf) { ggml_backend_buffer_free(mask_buf); }
+        if (mask_ctx) { ggml_free(mask_ctx); }
         if (sched) { ggml_backend_sched_free(sched); }
         for (auto * b : bufs) { ggml_backend_buffer_free(b); }
         for (auto * c : ctxs) { ggml_free(c); }
@@ -11523,6 +11536,238 @@ bool llama_jlens_compute_batch(
     }
 
     ggml_free(ctx0);
+    return true;
+}
+
+bool llama_jlens_topk_supported(const struct llama_context * ctx) {
+    // the vocab-wide argsort is only fast on a GPU backend (CUB); the CPU argsort is O(n^2)
+    const ggml_tensor * out = ctx ? ctx->model.output : nullptr;
+    return out && out->buffer && !ggml_backend_buffer_is_host(out->buffer);
+}
+
+// Upload the per-row token mask if the (layers, ids) set changed since the last call.
+static bool llama_jlens_update_mask(struct llama_jlens * jl, const llama_model & model, const int32_t * layers,
+                                    int32_t n_layers, const int32_t * const * mask_ids, const int32_t * n_mask_ids) {
+    const int64_t n_vocab = model.hparams.n_vocab;
+
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const void * p, size_t n) {
+        const uint8_t * b = (const uint8_t *) p;
+        for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    };
+    bool any = false;
+    mix(&n_layers, sizeof(n_layers));
+    for (int i = 0; i < n_layers; i++) {
+        const int32_t n = mask_ids && n_mask_ids && mask_ids[i] ? n_mask_ids[i] : 0;
+        mix(&layers[i], sizeof(int32_t));
+        mix(&n, sizeof(n));
+        if (n > 0) { mix(mask_ids[i], (size_t) n * sizeof(int32_t)); any = true; }
+    }
+    if (h == jl->mask_hash && (int32_t) jl->mask_n_masked.size() == n_layers) return true;
+
+    jl->mask_n_masked.assign(n_layers, 0);
+    jl->mask_any = any;
+    jl->mask_hash = h;
+    if (!any) return true;
+
+    if (jl->mask_cap < n_layers) {
+        if (jl->mask_buf) { ggml_backend_buffer_free(jl->mask_buf); jl->mask_buf = nullptr; }
+        if (jl->mask_ctx) { ggml_free(jl->mask_ctx); jl->mask_ctx = nullptr; }
+        jl->mask = nullptr;
+        jl->mask_cap = 0;
+
+        struct ggml_init_params ip = { /*.mem_size =*/ ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+        jl->mask_ctx = ggml_init(ip);
+        if (!jl->mask_ctx) { jl->mask_hash = 0; return false; }
+        jl->mask = ggml_new_tensor_2d(jl->mask_ctx, GGML_TYPE_F32, n_vocab, n_layers);
+        ggml_set_name(jl->mask, "jlens_mask");
+        jl->mask_buf = ggml_backend_alloc_ctx_tensors_from_buft(jl->mask_ctx, ggml_backend_buffer_get_type(model.output->buffer));
+        if (!jl->mask_buf) {
+            ggml_free(jl->mask_ctx); jl->mask_ctx = nullptr; jl->mask = nullptr; jl->mask_hash = 0;
+            return false;
+        }
+        // like J: weights usage keeps the masking ops on the lm_head's device
+        ggml_backend_buffer_set_usage(jl->mask_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        jl->mask_cap = n_layers;
+    }
+
+    std::vector<float> m((size_t) n_vocab * n_layers, 0.0f);
+    for (int i = 0; i < n_layers; i++) {
+        const int32_t n = mask_ids && n_mask_ids && mask_ids[i] ? n_mask_ids[i] : 0;
+        float * row = m.data() + (size_t) i * n_vocab;
+        for (int32_t j = 0; j < n; j++) {
+            const int32_t t = mask_ids[i][j];
+            if (t < 0 || t >= n_vocab || row[t] != 0.0f) continue; // an id listed twice counts once
+            row[t] = -INFINITY;
+            jl->mask_n_masked[i]++;
+        }
+    }
+    ggml_backend_tensor_set(jl->mask, m.data(), 0, m.size() * sizeof(float));
+    return true;
+}
+
+// Rows (layer x position) per readout graph. Each row holds a few vocab-sized F32/I32 buffers
+// (logits, probs, argsort, CUB scratch), so this bounds the readout's VRAM at ~1-2 GiB.
+static constexpr int64_t JLENS_TOPK_MAX_ROWS = 256;
+
+bool llama_jlens_topk(
+        struct llama_context * ctx,
+        struct llama_jlens   * jl,
+               const int32_t * layers,
+                     int32_t   n_layers,
+                     int32_t   n_pos,
+                 const float * residuals,
+                        bool   use_jacobian,
+                     int32_t   k,
+       const int32_t * const * mask_ids,
+               const int32_t * n_mask_ids,
+                        bool   renorm,
+                     int32_t * out_ids,
+                       float * out_probs) {
+    if (!ctx || !jl || n_layers <= 0 || n_pos <= 0 || k <= 0 || !layers || !residuals || !out_ids || !out_probs) return false;
+    if (!llama_jlens_topk_supported(ctx)) return false;
+
+    const llama_model & model = ctx->model;
+    const int64_t n_embd  = model.hparams.n_embd;
+    const int64_t n_vocab = model.hparams.n_vocab;
+    k = (int32_t) std::min<int64_t>(k, n_vocab);
+
+    const bool  use_rms = model.hparams.f_norm_rms_eps != 0.0f;
+    const float eps     = use_rms ? model.hparams.f_norm_rms_eps : model.hparams.f_norm_eps;
+
+    std::vector<struct ggml_tensor *> Js(n_layers, nullptr);
+    for (int i = 0; i < n_layers; i++) {
+        const int idx = jl->index_of(layers[i]);
+        if (use_jacobian && idx < 0) {
+            LLAMA_LOG_ERROR("%s: layer %d not fitted in this lens\n", __func__, layers[i]);
+            return false;
+        }
+        if (idx >= 0) Js[i] = jl->tensors[idx];
+    }
+
+    if (!llama_jlens_update_mask(jl, model, layers, n_layers, mask_ids, n_mask_ids)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the jlens mask\n", __func__);
+        return false;
+    }
+
+    if (!jl->sched) {
+        jl->sched = ggml_backend_sched_new(ctx->backends.data(), nullptr,
+                                           ctx->backends.size(), 2048, false);
+        if (!jl->sched) {
+            LLAMA_LOG_ERROR("%s: failed to create jlens scheduler\n", __func__);
+            return false;
+        }
+    }
+
+    const int32_t chunk = (int32_t) std::max<int64_t>(1, JLENS_TOPK_MAX_ROWS / n_layers);
+    std::vector<int32_t> ids_tmp;
+    std::vector<float>   probs_tmp;
+
+    for (int32_t p0 = 0; p0 < n_pos; p0 += chunk) {
+        const int32_t n_p    = std::min(chunk, n_pos - p0);
+        const int64_t n_rows = (int64_t) n_layers * n_p;
+
+        const size_t mem = ggml_tensor_overhead() * ((size_t) n_layers * 4 + 64) + ggml_graph_overhead() + 32;
+        if (jl->buf_topk.size() < mem) jl->buf_topk.resize(mem);
+        const uintptr_t raw = (uintptr_t) jl->buf_topk.data();
+        const size_t    off = (16 - (raw % 16)) % 16;
+        struct ggml_init_params ip = { jl->buf_topk.size() - off, jl->buf_topk.data() + off, /*.no_alloc =*/ true };
+        ggml_context * ctx0 = ggml_init(ip);
+        if (!ctx0) return false;
+
+        // rows are layer-major: row = layer * n_p + pos
+        struct ggml_tensor * h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_set_name(h, "jlens_h_topk");
+        ggml_set_input(h);
+
+        struct ggml_tensor * t = h;
+        if (use_jacobian) {
+            // unit-RMS h keeps the F16 product finite; exact because the final norm is scale-invariant
+            struct ggml_tensor * hn = ggml_rms_norm(ctx0, h, 1e-12f);
+            std::vector<struct ggml_tensor *> parts(n_layers);
+            for (int i = 0; i < n_layers; i++) {
+                struct ggml_tensor * hi = ggml_view_2d(ctx0, hn, n_embd, n_p, hn->nb[1], (size_t) i * n_p * hn->nb[1]);
+                parts[i] = ggml_mul_mat(ctx0, Js[i], hi);
+            }
+            // pairwise concat back into one [n_embd, n_rows] block for a single lm_head product
+            while (parts.size() > 1) {
+                std::vector<struct ggml_tensor *> next;
+                for (size_t i = 0; i + 1 < parts.size(); i += 2) next.push_back(ggml_concat(ctx0, parts[i], parts[i + 1], 1));
+                if (parts.size() % 2) next.push_back(parts.back());
+                parts.swap(next);
+            }
+            t = parts[0];
+        }
+
+        struct ggml_tensor * n = use_rms ? ggml_rms_norm(ctx0, t, eps) : ggml_norm(ctx0, t, eps);
+        n = ggml_mul(ctx0, n, model.output_norm);
+        struct ggml_tensor * l = ggml_mul_mat(ctx0, model.output, n); // [n_vocab, n_rows]
+        if (model.hparams.f_logit_scale != 0.0f) l = ggml_scale(ctx0, l, model.hparams.f_logit_scale);
+
+        // masked logits: the [n_vocab, 1, n_layers] mask broadcasts over each layer's positions
+        struct ggml_tensor * lm = l;
+        if (jl->mask_any) {
+            struct ggml_tensor * mview = ggml_view_3d(ctx0, jl->mask, n_vocab, 1, n_layers, jl->mask->nb[1], jl->mask->nb[1], 0);
+            lm = ggml_add(ctx0, ggml_reshape_3d(ctx0, l, n_vocab, n_p, n_layers), mview);
+            lm = ggml_reshape_2d(ctx0, lm, n_vocab, n_rows);
+        }
+
+        // Rank by masked logit, not probability: when an attractor holds ~all the mass the other
+        // probabilities underflow to 0 and their order would be lost.
+        struct ggml_tensor * top = ggml_cont(ctx0, ggml_top_k(ctx0, lm, k)); // [k, n_rows] I32
+        ggml_set_name(top, "jlens_top_ids");
+        ggml_set_output(top);
+
+        struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+        ggml_build_forward_expand(gf, top);
+
+        // renorm: softmax over the unmasked vocab, else the plain softmax. Built after the argsort so
+        // SOFT_MAX is not followed by RESHAPE/ARGSORT/VIEW/GET_ROWS, which the CUDA backend would fuse
+        // as expert routing (topk-moe), a kernel not meant for a 262k vocab.
+        struct ggml_tensor * p = ggml_soft_max(ctx0, renorm ? lm : l);
+        struct ggml_tensor * vals = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, p, 1, n_vocab, n_rows), top); // [1, k, n_rows]
+        ggml_set_name(vals, "jlens_top_probs");
+        ggml_set_output(vals);
+        ggml_build_forward_expand(gf, vals);
+
+        ggml_backend_sched_reset(jl->sched);
+        if (!ggml_backend_sched_alloc_graph(jl->sched, gf)) {
+            LLAMA_LOG_ERROR("%s: failed to alloc jlens top-k graph\n", __func__);
+            ggml_free(ctx0);
+            return false;
+        }
+
+        for (int i = 0; i < n_layers; i++) {
+            ggml_backend_tensor_set(h, residuals + ((size_t) i * n_pos + p0) * n_embd,
+                                    (size_t) i * n_p * n_embd * sizeof(float), (size_t) n_p * n_embd * sizeof(float));
+        }
+
+        const ggml_status st = llama_jlens_sched_compute(ctx, jl->sched, gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: jlens top-k graph compute failed (%d)\n", __func__, (int) st);
+            ggml_free(ctx0);
+            return false;
+        }
+
+        ids_tmp.resize((size_t) k * n_rows);
+        probs_tmp.resize((size_t) k * n_rows);
+        ggml_backend_tensor_get(top,  ids_tmp.data(),   0, ids_tmp.size()   * sizeof(int32_t));
+        ggml_backend_tensor_get(vals, probs_tmp.data(), 0, probs_tmp.size() * sizeof(float));
+        ggml_free(ctx0);
+
+        for (int i = 0; i < n_layers; i++) {
+            const int64_t k_eff = std::min<int64_t>(k, n_vocab - jl->mask_n_masked[i]);
+            for (int32_t pi = 0; pi < n_p; pi++) {
+                const size_t src = ((size_t) i * n_p + pi) * k;
+                const size_t dst = ((size_t) i * n_pos + p0 + pi) * k;
+                for (int32_t j = 0; j < k; j++) {
+                    const bool keep = j < k_eff;
+                    out_ids  [dst + j] = keep ? ids_tmp  [src + j] : -1;
+                    out_probs[dst + j] = keep ? probs_tmp[src + j] : 0.0f;
+                }
+            }
+        }
+    }
     return true;
 }
 

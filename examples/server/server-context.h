@@ -415,6 +415,21 @@ struct server_context {
     void jlens_top_k(float* pv, int n_vocab, size_t k, const std::vector<const std::vector<llama_token>*>& masks,
                      bool renorm, std::vector<int>& order, completion_token_output::layer_probs& lp);
 
+    // Readout reduced to top-k on the backend (llama_jlens_topk). Off when the lm_head is on the CPU,
+    // or with LLAMA_JLENS_HOST_TOPK=1 (host softmax + sort, for A/B checks).
+    bool jlens_use_backend_topk() const;
+
+    // jlens_masks_for() flattened per layer, in the pointer/count form llama_jlens_topk takes.
+    struct jlens_flat_masks {
+        std::vector<std::vector<int32_t>> ids;
+        std::vector<const int32_t *>      ptrs;
+        std::vector<int32_t>              n;
+    };
+    jlens_flat_masks jlens_masks_flat(const server_slot& slot, const std::vector<int32_t>& layers) const;
+
+    // One layer_probs from k (id, prob) pairs of llama_jlens_topk; stops at the first id < 0.
+    completion_token_output::layer_probs jlens_layer_from_topk(int32_t layer, const int32_t* ids, const float* probs, size_t k);
+
     // Read out the prompt rows of the batch that was just decoded.
     void collect_jlens_prompt_probs(const llama_batch& batch_view);
 

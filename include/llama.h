@@ -937,6 +937,26 @@ extern "C" {
                             bool   use_jacobian,
                            float * out_probs);
 
+    // For now, the GPU must be handling the lm_head for this to work.
+    LLAMA_API bool llama_jlens_topk_supported(const struct llama_context * ctx);
+
+    // Computes top-k tokens per (layer, position) on the backend to reduce host transfer.
+    // Processed as a single product across all layers.
+    LLAMA_API bool llama_jlens_topk(
+            struct llama_context * ctx,
+            struct llama_jlens   * jl,
+                   const int32_t * layers,
+                         int32_t   n_layers,
+                         int32_t   n_pos,
+                     const float * residuals,
+                            bool   use_jacobian,
+                         int32_t   k,
+           const int32_t * const * mask_ids,
+                   const int32_t * n_mask_ids,
+                            bool   renorm,
+                         int32_t * out_ids,
+                           float * out_probs);
+
     // J-lens vectors for one token: v_l = J_l^T (gamma * W_U[token]), the direction in
     // layer-l residual space whose amplification raises that token's lens logit
     LLAMA_API bool llama_jlens_vectors(

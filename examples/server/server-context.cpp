@@ -2831,6 +2831,39 @@ void server_context::jlens_top_k(float* pv, int n_vocab, size_t k, const std::ve
     }
 }
 
+bool server_context::jlens_use_backend_topk() const {
+    static const bool host = [] {
+        const char * env = getenv("LLAMA_JLENS_HOST_TOPK");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return !host && llama_jlens_topk_supported(ctx);
+}
+
+server_context::jlens_flat_masks server_context::jlens_masks_flat(const server_slot& slot, const std::vector<int32_t>& layers) const {
+    jlens_flat_masks out;
+    out.ids.resize(layers.size());
+    for (size_t i = 0; i < layers.size(); i++) {
+        for (const auto* mask : jlens_masks_for(slot, layers[i])) {
+            out.ids[i].insert(out.ids[i].end(), mask->begin(), mask->end());
+        }
+    }
+    for (auto& v : out.ids) {
+        out.ptrs.push_back(v.data());
+        out.n.push_back((int32_t) v.size());
+    }
+    return out;
+}
+
+completion_token_output::layer_probs server_context::jlens_layer_from_topk(int32_t layer, const int32_t* ids, const float* probs, size_t k) {
+    completion_token_output::layer_probs lp;
+    lp.layer = layer;
+    lp.probs.reserve(k);
+    for (size_t j = 0; j < k && ids[j] >= 0; j++) {
+        lp.probs.push_back({ ids[j], common_token_to_piece(ctx, ids[j], params_base.special), probs[j] });
+    }
+    return lp;
+}
+
 // Jacobian-lens readout for the token sampled at batch row `idx`: for each requested source layer,
 // transport the captured residual through the lens and unembed, then report the top-k tokens with softmax probabilities.
 void server_context::populate_jlens_probs(const server_slot& slot, completion_token_output& result, int idx) {
@@ -2876,6 +2909,24 @@ void server_context::populate_jlens_probs(const server_slot& slot, completion_to
 
     const int n = (int) got_layers.size();
     layers.swap(got_layers);
+
+    if (jlens_use_backend_topk()) {
+        const size_t k = std::min((size_t) slot.params.jlens_n_probs, (size_t) n_vocab);
+        const auto masks = jlens_masks_flat(slot, layers);
+        std::vector<int32_t> ids((size_t) n * k);
+        std::vector<float>   probs((size_t) n * k);
+        if (llama_jlens_topk(ctx, jlens, layers.data(), n, 1, residuals.data(), slot.params.jlens_use_jacobian,
+                             (int32_t) k, masks.ptrs.data(), masks.n.data(), slot.params.jlens_mask_renorm,
+                             ids.data(), probs.data())) {
+            result.jlens_layers.reserve(n);
+            for (int i = 0; i < n; i++) {
+                result.jlens_layers.push_back(jlens_layer_from_topk(layers[i], ids.data() + (size_t) i * k,
+                                                                    probs.data() + (size_t) i * k, k));
+            }
+            return;
+        }
+        LOG_WARNING("jlens: backend top-k failed, falling back to host readout", {{"n_layers", n}});
+    }
 
     std::vector<float> logits((size_t) n * n_vocab);
     if (!llama_jlens_compute(ctx, jlens, layers.data(), n, residuals.data(),
@@ -2959,6 +3010,54 @@ void server_context::jlens_prompt_readout(server_slot& slot, const std::vector<i
     }
 
     const int n_l = (int) got.size();
+
+    if (jlens_use_backend_topk()) {
+        // only k ids/probs per (layer, position) come back; chunk bounds the gathered residuals (~64 MiB)
+        const size_t k = std::min((size_t) slot.params.jlens_n_probs, (size_t) n_vocab);
+        const int chunk_b = (int) std::max<size_t>(1, (64ull << 20) / ((size_t) n_l * n_embd * sizeof(float)));
+        const auto masks = jlens_masks_flat(slot, got);
+        std::vector<float>   residuals;
+        std::vector<int32_t> ids;
+        std::vector<float>   probs;
+        bool ok = true;
+        for (size_t c0 = 0; c0 < rows.size() && ok; c0 += chunk_b) {
+            const int n_p = (int) std::min((size_t) chunk_b, rows.size() - c0);
+            residuals.resize((size_t) n_l * n_p * n_embd);
+            bool complete = true;
+            for (int li = 0; li < n_l && complete; li++) {
+                for (int pi = 0; pi < n_p; pi++) {
+                    const float * h = jlens_cap.row(got[li], (size_t) rows[c0 + pi]);
+                    if (h == nullptr) { complete = false; break; }
+                    memcpy(residuals.data() + ((size_t) li * n_p + pi) * n_embd, h, n_embd * sizeof(float));
+                }
+            }
+            if (!complete) continue;
+
+            ids.resize((size_t) n_l * n_p * k);
+            probs.resize((size_t) n_l * n_p * k);
+            if (!llama_jlens_topk(ctx, jlens, got.data(), n_l, n_p, residuals.data(), slot.params.jlens_use_jacobian,
+                                  (int32_t) k, masks.ptrs.data(), masks.n.data(), slot.params.jlens_mask_renorm,
+                                  ids.data(), probs.data())) {
+                LOG_WARNING("jlens: prompt probe top-k failed", {{"n_layers", n_l}, {"n_pos", n_p}});
+                ok = false;
+                break;
+            }
+            for (int pi = 0; pi < n_p; pi++) {
+                jlens_prompt_output out;
+                out.pos = poss[c0 + pi];
+                out.tok = slot.prompt_tokens[out.pos];
+                out.media = media;
+                out.layers.reserve(n_l);
+                for (int li = 0; li < n_l; li++) {
+                    const size_t off = ((size_t) li * n_p + pi) * k;
+                    out.layers.push_back(jlens_layer_from_topk(got[li], ids.data() + off, probs.data() + off, k));
+                }
+                slot.jlens_prompt_probs.push_back(std::move(out));
+            }
+        }
+        return;
+    }
+
     // ~128 MiB of probabilities per chunk
     int chunk = (int) ((128ull << 20) / ((size_t) n_l * n_vocab * sizeof(float)));
     chunk = std::max(1, std::min(chunk, 32));
